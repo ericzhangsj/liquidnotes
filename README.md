@@ -10,6 +10,15 @@ Cauchy chromatic dispersion → Blinn-Phong specular → rim meniscus.
 - Every material parameter is live-tunable, and **zero means zero**:
   all sliders at 0 = pixel-perfect passthrough of the sharp desktop.
 
+## Use
+
+Run `liquidnotes.exe`. A glass ➕ button docks at the bottom-right of the
+screen: **left-click** spawns a note stacked above it (drag anywhere to move,
+pull any edge/corner to resize), **right-click** opens the menu (New note /
+Quit). Notes appear in screenshots and screen shares — the engine
+reconstructs a background-only texture from capture dirty rects instead of
+excluding its windows from capture.
+
 ## Material parameters
 
 | Parameter | Effect |
@@ -18,6 +27,12 @@ Cauchy chromatic dispersion → Blinn-Phong specular → rim meniscus.
 | `SURFACE_TENSION_FALLOFF` | Width of the curved meniscus edge band |
 | `CHROMATIC_DISPERSION_AMOUNT` | R/G/B wavelength separation (prism fringe). `0.0` = none |
 | `FROST_BLUR_RADIUS` | Gaussian pre-blur under the physics. `0` = pass skipped entirely |
+
+Quick experiments via env vars (until the settings UI lands):
+`LN_REFRACT`, `LN_TENSION`, `LN_DISPERSION`, `LN_FROST`, `LN_HEIGHT`,
+`LN_SPEC`, `LN_RIM`, `LN_TINT` — e.g. `$env:LN_FROST=8; .\liquidnotes.exe`.
+Setting all of them to 0 renders a pixel-perfect passthrough (verified by
+screenshot diff — the note becomes optically invisible).
 
 ## Build
 

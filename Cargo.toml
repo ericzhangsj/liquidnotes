@@ -24,6 +24,9 @@ features = [
     "Win32_UI_HiDpi",
 ]
 
+[dev-dependencies]
+png = "0.17"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
