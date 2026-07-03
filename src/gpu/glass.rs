@@ -298,10 +298,18 @@ impl GlassRenderer {
             1.0 / cap.width as f32,
             1.0 / cap.height as f32,
         ];
+        // Dome span in px from the dimensionless falloff: 1.0 reaches the
+        // center, higher confines the curve to the border, 0 = flat glass.
+        let min_half = 0.5 * w.min(h) as f32;
+        let band = if mat.surface_tension_falloff <= 0.0 {
+            0.0
+        } else {
+            (min_half / mat.surface_tension_falloff.max(0.05)).min(4.0 * min_half)
+        };
         let mut p = Params {
             shape: [
                 mat.corner_radius,
-                mat.surface_tension_falloff,
+                band,
                 mat.height_scale,
                 if glyph { 1.0 } else { 0.0 },
             ],
@@ -312,7 +320,12 @@ impl GlassRenderer {
                 mat.specular_exponent.max(1.0),
                 mat.specular_intensity,
             ],
-            rim: [mat.rim_exponent.max(0.01), mat.rim_intensity, 0.0, 0.0],
+            rim: [
+                mat.rim_exponent.max(0.01),
+                mat.rim_intensity,
+                mat.dome_exponent,
+                0.0,
+            ],
             tint: [
                 mat.tint_color.0,
                 mat.tint_color.1,

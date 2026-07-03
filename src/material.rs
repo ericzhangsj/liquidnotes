@@ -6,9 +6,11 @@ pub struct GlassMaterial {
     /// MATERIAL_REFRACTIVE_INDEX — how violently the backdrop warps, in px of
     /// normal-driven displacement. 0.0 = refraction off.
     pub refractive_index: f32,
-    /// SURFACE_TENSION_FALLOFF — width of the meniscus edge band, px. Lower =
-    /// the fluid curl bleeds toward the center; higher values relative to the
-    /// note size restrict it to the border. (Band width; 0 disables the edge.)
+    /// SURFACE_TENSION_FALLOFF — dimensionless restriction of the dome.
+    /// The curved shoulder spans `min_half_extent / falloff` pixels, so
+    /// LOWER values bleed the curve deeper into the center (1.0 = the dome
+    /// reaches the exact center) and HIGHER values confine the liquid look
+    /// to the outer border. Exactly 0 = flat glass, no curvature at all.
     pub surface_tension_falloff: f32,
     /// CHROMATIC_DISPERSION_AMOUNT — R<->B separation in px along the warp
     /// (Cauchy-weighted: eta_R < eta_G < eta_B). 0.0 = zero color separation.
@@ -20,6 +22,9 @@ pub struct GlassMaterial {
     pub corner_radius: f32,
     /// Peak height of the slab in px — scales the normals' tilt.
     pub height_scale: f32,
+    /// Superellipse exponent of the dome profile: 2 = circular arc,
+    /// higher = flatter top with a steeper rim.
+    pub dome_exponent: f32,
     pub light_dir: (f32, f32),
     pub specular_exponent: f32,
     pub specular_intensity: f32,
@@ -32,12 +37,13 @@ pub struct GlassMaterial {
 impl Default for GlassMaterial {
     fn default() -> Self {
         Self {
-            refractive_index: 16.0,
-            surface_tension_falloff: 26.0,
-            chromatic_dispersion: 6.0,
+            refractive_index: 30.0,
+            surface_tension_falloff: 1.0,
+            chromatic_dispersion: 10.0,
             frost_blur_radius: 0.0,
             corner_radius: 14.0,
-            height_scale: 26.0,
+            height_scale: 42.0,
+            dome_exponent: 3.0,
             light_dir: (-0.55, -0.75),
             specular_exponent: 42.0,
             specular_intensity: 0.32,
@@ -77,6 +83,9 @@ impl GlassMaterial {
         }
         if let Some(v) = get("LN_HEIGHT") {
             m.height_scale = v;
+        }
+        if let Some(v) = get("LN_DOME") {
+            m.dome_exponent = v;
         }
         if let Some(v) = get("LN_SPEC") {
             m.specular_intensity = v;

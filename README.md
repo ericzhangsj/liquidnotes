@@ -14,17 +14,19 @@ Cauchy chromatic dispersion → Blinn-Phong specular → rim meniscus.
 
 Run `liquidnotes.exe`. A glass ➕ button docks at the bottom-right of the
 screen: **left-click** spawns a note stacked above it (drag anywhere to move,
-pull any edge/corner to resize), **right-click** opens the menu (New note /
-Quit). Notes appear in screenshots and screen shares — the engine
-reconstructs a background-only texture from capture dirty rects instead of
-excluding its windows from capture.
+pull any edge/corner to resize), **right-click** opens the menu (New note / backdrop mode / Quit).
+
+Backdrop modes: **live** (default) keeps video etc. playing under the glass
+but hides notes from screenshots/recordings; unchecking it switches to
+reconstruction mode — notes show in captures, at the cost of content that is
+fully hidden under a stationary note freezing until revealed.
 
 ## Material parameters
 
 | Parameter | Effect |
 |---|---|
 | `MATERIAL_REFRACTIVE_INDEX` | How violently the backdrop warps. `0.0` = refraction off |
-| `SURFACE_TENSION_FALLOFF` | Width of the curved meniscus edge band |
+| `SURFACE_TENSION_FALLOFF` | Dome restriction: lower bleeds the curve deeper into the center (1.0 = reaches center), higher confines it to the border. `0` = flat |
 | `CHROMATIC_DISPERSION_AMOUNT` | R/G/B wavelength separation (prism fringe). `0.0` = none |
 | `FROST_BLUR_RADIUS` | Gaussian pre-blur under the physics. `0` = pass skipped entirely |
 

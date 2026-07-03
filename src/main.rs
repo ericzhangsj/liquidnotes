@@ -29,6 +29,7 @@ const STACK_GAP: i32 = 12;
 const RESIZE_BORDER: i32 = 9;
 const IDM_NEW: u32 = 1;
 const IDM_QUIT: u32 = 2;
+const IDM_BACKDROP: u32 = 3;
 /// Timer driving capture+render while a modal move/size loop is running.
 const TIMER_MODAL: usize = 1;
 
@@ -44,6 +45,12 @@ struct App {
     mat: GlassMaterial,
     windows: Vec<Win>,
     spawned: u32,
+    /// Live mode (default): our windows are excluded from capture, so the
+    /// backdrop under a note stays fully live (video keeps playing under the
+    /// glass) — but the notes are invisible in screenshots/recordings.
+    /// Off: reconstruction mode — notes show in screenshots; content fully
+    /// hidden under a stationary note freezes until revealed.
+    live: bool,
 }
 
 // Single-threaded app; wndproc reaches the state through this pointer.
@@ -77,6 +84,7 @@ fn main() -> Result<()> {
         mat: GlassMaterial::from_env(),
         windows: Vec::new(),
         spawned: 0,
+        live: std::env::var("LN_BACKDROP").map(|v| v != "capture").unwrap_or(true),
     });
 
     unsafe {
@@ -153,6 +161,10 @@ impl App {
                 Some(instance.into()),
                 None,
             )?;
+            if self.live {
+                // Before first show, so the capture never sees this window.
+                let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+            }
             let surface = self.renderer.create_surface(hwnd, w as u32, h as u32)?;
             self.windows.push(Win {
                 hwnd,
@@ -220,7 +232,9 @@ impl App {
     /// One engine heartbeat: pump duplication frames into the background
     /// (excluding our windows), and re-render everything if it changed.
     fn pump(&mut self, force_render: bool) {
-        let rects = self.window_rects();
+        // Live mode: our windows never appear in capture frames, so nothing
+        // needs masking and the pixels under notes stay current.
+        let rects = if self.live { Vec::new() } else { self.window_rects() };
         let updated = self.cap.tick(&rects);
         if updated || force_render {
             for i in 0..self.windows.len() {
@@ -243,6 +257,24 @@ impl App {
         self.render_one(i);
     }
 
+    fn toggle_backdrop_mode(&mut self) {
+        self.live = !self.live;
+        let affinity = if self.live {
+            WDA_EXCLUDEFROMCAPTURE
+        } else {
+            WDA_NONE
+        };
+        for w in &self.windows {
+            unsafe {
+                let _ = SetWindowDisplayAffinity(w.hwnd, affinity);
+            }
+        }
+        // Whichever direction we switched, the background heals itself:
+        // to live, dirty rects now flow everywhere; to reconstruction, our
+        // windows start being masked again from the next tick.
+        self.pump(true);
+    }
+
     fn show_button_menu(&mut self, hwnd: HWND) -> u32 {
         unsafe {
             let menu = match CreatePopupMenu() {
@@ -250,6 +282,13 @@ impl App {
                 Err(_) => return 0,
             };
             let _ = AppendMenuW(menu, MF_STRING, IDM_NEW as usize, w!("New note"));
+            let check = if self.live { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING | check,
+                IDM_BACKDROP as usize,
+                w!("Live backdrop (notes hidden in screenshots)"),
+            );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, IDM_QUIT as usize, w!("Quit liquidnotes"));
             let mut pt = POINT::default();
@@ -356,6 +395,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if is_button {
                 match app.show_button_menu(hwnd) {
                     IDM_NEW => app.spawn_note(),
+                    IDM_BACKDROP => app.toggle_backdrop_mode(),
                     IDM_QUIT => unsafe { PostQuitMessage(0) },
                     _ => {}
                 }

@@ -12,7 +12,7 @@ cbuffer Params : register(b0) {
                    // z: height scale  | w: glyph (0 none, 1 plus)
     float4 refr;   // xyz: eta per channel, px of displacement (R < G < B)
     float4 light;  // xy: light dir | z: specular exponent | w: specular intensity
-    float4 rim;    // x: rim exponent | y: rim intensity
+    float4 rim;    // x: rim exponent | y: rim intensity | z: dome exponent
     float4 tint;   // rgb: tint color | w: tint amount (0 = untinted)
     float4 blur;   // x: sigma | y: radius texels | zw: blur direction
 };
@@ -36,14 +36,23 @@ float sdrb(float2 p, float2 b, float r) {
     return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
 }
 
-// 2.5D height field z = f(x,y): flat slab with a meniscus that curls down
-// across the edge band. Quintic smootherstep profile: C2-continuous at BOTH
-// ends of the band — a circular-arc profile is only C1 and its curvature
-// jump shades as a visible ring.
-float hgt(float2 p, float2 halfsz, float r, float w) {
-    float d = sdrb(p, halfsz, r);
-    float t = saturate(-d / max(w, 1e-3));
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+// 1D superellipse shoulder: 0 at the rim rising to 1, steep at the rim and
+// easing C2-smoothly into the plateau (q: 2 = circular arc, 3+ = flatter
+// top / steeper rim; for q > 2 curvature -> 0 at the plateau junction, so
+// the transition cannot shade as a ring).
+float prof(float t, float q) {
+    float u = 1.0 - saturate(t);
+    return pow(saturate(1.0 - pow(u, q)), 1.0 / q);
+}
+
+// 2.5D height field z = f(x,y): product of the two axis profiles — a smooth
+// "loaf" dome whose shoulders reach into the interior. A rounded-box-SDF
+// height field would put gradient creases along the corner diagonals (they
+// shade as an X); the separable product has none.
+float hgt(float2 p, float2 halfsz, float w, float q) {
+    float tx = (halfsz.x - abs(p.x)) / max(w, 1e-3);
+    float ty = (halfsz.y - abs(p.y)) / max(w, 1e-3);
+    return prof(tx, q) * prof(ty, q);
 }
 
 float4 psglass(VSO i) : SV_Target {
@@ -55,21 +64,27 @@ float4 psglass(VSO i) : SV_Target {
     float hs = shape.z;
 
     float d = sdrb(p, halfsz, rad);
+    float dome = max(rim.z, 1.05);
 
     // N = normalize([-df/dx, -df/dy, 1]), central differences, eps = 1px
     float e = 1.0;
-    float hx = hgt(p + float2(e, 0), halfsz, rad, band)
-             - hgt(p - float2(e, 0), halfsz, rad, band);
-    float hy = hgt(p + float2(0, e), halfsz, rad, band)
-             - hgt(p - float2(0, e), halfsz, rad, band);
+    float hx = hgt(p + float2(e, 0), halfsz, band, dome)
+             - hgt(p - float2(e, 0), halfsz, band, dome);
+    float hy = hgt(p + float2(0, e), halfsz, band, dome)
+             - hgt(p - float2(0, e), halfsz, band, dome);
     float3 N = normalize(float3(-hx * hs / (2.0 * e), -hy * hs / (2.0 * e), 1.0));
 
-    // Snell approximation with Cauchy dispersion: three taps, one channel each.
+    // Snell approximation, convex-lens regime: sample TOWARD the center
+    // (minus sign), increasingly so where the surface tilts — the backdrop
+    // magnifies/expands toward the rim like a plano-convex lens. At the
+    // center N = (0,0,1) so sin(theta1) = 0 and light passes undeviated.
+    // Cauchy dispersion: three taps, one channel each, eta_R < eta_G < eta_B
+    // so blue bends hardest (cyan inner fringe, warm outer halo).
     float2 baseUV = (pane.zw + i.uv * size) * src.zw;
     float3 col;
-    col.r = srcTex.Sample(samp, baseUV + N.xy * refr.x * src.zw).r;
-    col.g = srcTex.Sample(samp, baseUV + N.xy * refr.y * src.zw).g;
-    col.b = srcTex.Sample(samp, baseUV + N.xy * refr.z * src.zw).b;
+    col.r = srcTex.Sample(samp, baseUV - N.xy * refr.x * src.zw).r;
+    col.g = srcTex.Sample(samp, baseUV - N.xy * refr.y * src.zw).g;
+    col.b = srcTex.Sample(samp, baseUV - N.xy * refr.z * src.zw).b;
 
     col = lerp(col, tint.rgb, tint.w);
 
