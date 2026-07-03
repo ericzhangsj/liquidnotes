@@ -27,3 +27,16 @@ cargo build --release
 ```
 
 Releases are built automatically by GitHub Actions on tagged pushes.
+
+### Building on Windows without Visual Studio (GNU toolchain)
+
+The MSVC toolchain (default, used by CI) needs VS Build Tools. To build with
+the fully user-level GNU toolchain instead:
+
+1. `rustup default stable-x86_64-pc-windows-gnu`
+2. Install [w64devkit](https://github.com/skeeto/w64devkit) (portable zip)
+   and put its `bin` on PATH — the `windows` crates use raw-dylib linking,
+   which needs binutils' `dlltool`/`as` that rustup does not bundle.
+3. w64devkit ships no `libgcc_eh.a` (its unwinder lives in `libgcc.a`);
+   create an empty stub next to its `libgcc.a`:
+   `ar rcs lib\gcc\x86_64-w64-mingw32\<ver>\libgcc_eh.a`
