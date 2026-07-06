@@ -1,2 +1,11 @@
 /target
 *.png.tmp
+
+# Personal dev helper with a machine-specific toolchain path (see README for
+# the generic build steps).
+/run.bat
+
+# Editor / OS cruft
+*.rs.bk
+.DS_Store
+Thumbs.db

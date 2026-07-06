@@ -28,6 +28,16 @@ pub struct Capture {
     pub origin: (i32, i32),
     meta: Vec<u8>,
     seeded: bool,
+    /// Cursor, in output-local pixels. The duplicated desktop image bakes the
+    /// pointer in on some drivers, so we mask its rect out of the copy — else
+    /// the glass refracts a ghost cursor in the background.
+    cursor_w: u32,
+    cursor_h: u32,
+    cursor_pos: (i32, i32),
+    cursor_visible: bool,
+    /// Bounding box (virtual-desktop coords) of everything copied last tick,
+    /// so the app can re-render only the notes it actually touched.
+    pub dirty_bounds: Option<RECT>,
 }
 
 impl Capture {
@@ -86,6 +96,11 @@ impl Capture {
                 origin,
                 meta: Vec::new(),
                 seeded: false,
+                cursor_w: 32,
+                cursor_h: 32,
+                cursor_pos: (0, 0),
+                cursor_visible: false,
+                dirty_bounds: None,
             })
         }
     }
@@ -115,8 +130,11 @@ impl Capture {
             .filter(|r| r.right > r.left && r.bottom > r.top)
             .collect();
 
+        self.dirty_bounds = None;
         let mut updated = false;
-        for _ in 0..4 {
+        // Drain to the latest frame each tick (bounded) so the background is
+        // never a stale queued frame behind what's on screen.
+        for _ in 0..8 {
             let dupl = self.dupl.as_ref().unwrap();
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
@@ -130,6 +148,38 @@ impl Capture {
                 }
                 Ok(()) => {}
             }
+
+            // Pointer state can arrive on any frame, including cursor-only
+            // ones, so read it before the LastPresentTime gate below.
+            if info.LastMouseUpdateTime != 0 {
+                self.cursor_visible = info.PointerPosition.Visible.as_bool();
+                self.cursor_pos = (
+                    info.PointerPosition.Position.x,
+                    info.PointerPosition.Position.y,
+                );
+            }
+            if info.PointerShapeBufferSize > 0 {
+                let need = info.PointerShapeBufferSize as usize;
+                if self.meta.len() < need {
+                    self.meta.resize(need, 0);
+                }
+                let mut got = 0u32;
+                let mut sinfo = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+                let ok = unsafe {
+                    dupl.GetFramePointerShape(
+                        need as u32,
+                        self.meta.as_mut_ptr() as *mut _,
+                        &mut got,
+                        &mut sinfo,
+                    )
+                }
+                .is_ok();
+                if ok && sinfo.Width > 0 && sinfo.Height > 0 {
+                    self.cursor_w = sinfo.Width;
+                    self.cursor_h = sinfo.Height;
+                }
+            }
+
             if info.LastPresentTime == 0 {
                 // Cursor-only update: the frame carries no valid desktop image.
                 drop(resource);
@@ -219,8 +269,15 @@ impl Capture {
                             Some(&src_box),
                         );
                     }
+                    self.grow_dirty(piece);
                 }
             }
+
+            // Note: the desktop image bakes the pointer (+ shadow) in on some
+            // drivers. We leave it in `background` (fully live, no masking or
+            // inpaint) and instead have the glass shader steer its refraction/
+            // blur samples out of the cursor's rect, so the pointer is never
+            // sampled and never appears in the glass. See `cursor_rect`.
             if !dirty.is_empty() {
                 updated = true;
                 self.seeded = true;
@@ -228,6 +285,51 @@ impl Capture {
             let _ = unsafe { self.dupl.as_ref().unwrap().ReleaseFrame() };
         }
         updated
+    }
+
+    /// Grow the changed bounding box (virtual-desktop coords) by an output-local
+    /// rect that was just written into `background`.
+    fn grow_dirty(&mut self, piece: RECT) {
+        let db = RECT {
+            left: piece.left + self.origin.0,
+            top: piece.top + self.origin.1,
+            right: piece.right + self.origin.0,
+            bottom: piece.bottom + self.origin.1,
+        };
+        self.dirty_bounds = Some(match self.dirty_bounds {
+            None => db,
+            Some(b) => RECT {
+                left: b.left.min(db.left),
+                top: b.top.min(db.top),
+                right: b.right.max(db.right),
+                bottom: b.bottom.max(db.bottom),
+            },
+        });
+    }
+
+    /// The pointer's rect in output-local pixels (padded to swallow its
+    /// drop-shadow), or None when the pointer is hidden. The glass shader keeps
+    /// its refraction/blur samples out of this rect so the baked-in pointer is
+    /// never sampled.
+    pub fn cursor_rect(&self) -> Option<RECT> {
+        if !self.cursor_visible {
+            return None;
+        }
+        let cw = self.cursor_w.max(1) as i32;
+        let ch = self.cursor_h.max(1) as i32;
+        let (cx, cy) = self.cursor_pos;
+        let (pad_tl, pad_br) = (3, 20); // shadow falls bottom-right
+        let r = RECT {
+            left: (cx - pad_tl).clamp(0, self.width as i32),
+            top: (cy - pad_tl).clamp(0, self.height as i32),
+            right: (cx + cw + pad_br).clamp(0, self.width as i32),
+            bottom: (cy + ch + pad_br).clamp(0, self.height as i32),
+        };
+        if r.right > r.left && r.bottom > r.top {
+            Some(r)
+        } else {
+            None
+        }
     }
 
     pub fn seeded(&self) -> bool {

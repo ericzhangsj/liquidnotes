@@ -1,114 +1,88 @@
-/// Every parameter of the glass. Zero means OFF — exactly:
-/// all-zero material + zero frost = pixel-identical passthrough of the
-/// sharp desktop (modulo nothing: no hidden DWM blur exists in this engine).
+/// Base glass: the knobs that matter. Zero means OFF — exactly:
+/// all-zero material = pixel-identical passthrough of the sharp desktop.
 #[derive(Clone, Copy, Debug)]
 pub struct GlassMaterial {
-    /// MATERIAL_REFRACTIVE_INDEX — how violently the backdrop warps, in px of
-    /// normal-driven displacement. 0.0 = refraction off.
-    pub refractive_index: f32,
-    /// SURFACE_TENSION_FALLOFF — dimensionless restriction of the dome.
-    /// The curved shoulder spans `min_half_extent / falloff` pixels, so
-    /// LOWER values bleed the curve deeper into the center (1.0 = the dome
-    /// reaches the exact center) and HIGHER values confine the liquid look
-    /// to the outer border. Exactly 0 = flat glass, no curvature at all.
-    pub surface_tension_falloff: f32,
-    /// CHROMATIC_DISPERSION_AMOUNT — R<->B separation in px along the warp
-    /// (Cauchy-weighted: eta_R < eta_G < eta_B). 0.0 = zero color separation.
-    pub chromatic_dispersion: f32,
-    /// FROST_BLUR_RADIUS — Gaussian sigma (px) applied to the backdrop BEFORE
-    /// the physics. 0.0 = the blur pass is skipped entirely.
-    pub frost_blur_radius: f32,
-
+    /// eta — how violently the backdrop warps, in px of normal-driven
+    /// displacement. 0.0 = refraction off.
+    pub refraction: f32,
+    /// 0..1 single dome knob: 0 = shallow shoulder confined near the border,
+    /// 1 = the dome reaches the center.
+    pub depth: f32,
+    /// Gaussian sigma (px) of the frost blur. 0.0 = blur pass skipped.
+    pub frost: f32,
     pub corner_radius: f32,
-    /// Peak height of the slab in px — scales the normals' tilt.
-    pub height_scale: f32,
-    /// Superellipse exponent of the dome profile: 2 = circular arc,
-    /// higher = flatter top with a steeper rim.
-    pub dome_exponent: f32,
-    pub light_dir: (f32, f32),
-    pub specular_exponent: f32,
-    pub specular_intensity: f32,
-    pub rim_exponent: f32,
-    pub rim_intensity: f32,
-    pub tint_color: (f32, f32, f32),
-    pub tint_amount: f32,
+    /// Rim zone width px.
+    pub border_thickness: f32,
+    /// Extra refraction at the rim (0 = none).
+    pub border_refract: f32,
+    /// Blinn-Phong rim glint intensity (0.0 = off).
+    pub lighting: f32,
+    /// Light azimuth in degrees (where the rim glint sits).
+    pub light_angle: f32,
+    /// Adaptive card-fill amount, 0..1 (0.0 = clear glass, 1.0 = solid card).
+    /// The fill colour auto-opposes the desktop: dark grey over light, white
+    /// over dark; the text ink then contrasts the fill.
+    pub opacity: f32,
 }
 
 impl Default for GlassMaterial {
     fn default() -> Self {
         Self {
-            refractive_index: 30.0,
-            surface_tension_falloff: 1.0,
-            chromatic_dispersion: 10.0,
-            frost_blur_radius: 0.0,
-            corner_radius: 14.0,
-            height_scale: 42.0,
-            dome_exponent: 3.0,
-            light_dir: (-0.55, -0.75),
-            specular_exponent: 42.0,
-            specular_intensity: 0.32,
-            rim_exponent: 2.6,
-            rim_intensity: 0.16,
-            tint_color: (1.0, 1.0, 1.0),
-            tint_amount: 0.0,
+            refraction: 60.0,
+            depth: 0.5,
+            frost: 3.9,
+            corner_radius: 32.0,
+            border_thickness: 2.3,
+            border_refract: 1.0,
+            lighting: 0.0,
+            light_angle: 135.0,
+            opacity: 0.2,
         }
     }
 }
 
 impl GlassMaterial {
-    /// Per-channel eta in px. Cauchy eta(lambda) = A + B/lambda^2 evaluated at
-    /// 650/510/475nm, normalized so `chromatic_dispersion` is the full R<->B
-    /// spread: eta_R = A - 0.716*B, eta_G = A, eta_B = A + 0.284*B.
-    pub fn etas(&self) -> (f32, f32, f32) {
-        let a = self.refractive_index;
-        let b = self.chromatic_dispersion;
-        (a - 0.716 * b, a, a + 0.284 * b)
-    }
-
-    /// Env-var overrides for quick experiments, e.g. `LN_FROST=8 liquidnotes`.
+    /// Env-var overrides for quick experiments, e.g. `LN_FROST=12 liquidnotes`.
     pub fn from_env() -> Self {
         let mut m = Self::default();
         let get = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
         if let Some(v) = get("LN_REFRACT") {
-            m.refractive_index = v;
+            m.refraction = v;
         }
-        if let Some(v) = get("LN_TENSION") {
-            m.surface_tension_falloff = v;
-        }
-        if let Some(v) = get("LN_DISPERSION") {
-            m.chromatic_dispersion = v;
+        if let Some(v) = get("LN_DEPTH") {
+            m.depth = v;
         }
         if let Some(v) = get("LN_FROST") {
-            m.frost_blur_radius = v;
+            m.frost = v;
         }
-        if let Some(v) = get("LN_HEIGHT") {
-            m.height_scale = v;
+        if let Some(v) = get("LN_CORNER") {
+            m.corner_radius = v;
         }
-        if let Some(v) = get("LN_DOME") {
-            m.dome_exponent = v;
+        if let Some(v) = get("LN_BORDER") {
+            m.border_thickness = v;
         }
-        if let Some(v) = get("LN_SPEC") {
-            m.specular_intensity = v;
+        if let Some(v) = get("LN_BREFRACT") {
+            m.border_refract = v;
+        }   
+        if let Some(v) = get("LN_LIGHT") {
+            m.lighting = v;
         }
-        if let Some(v) = get("LN_RIM") {
-            m.rim_intensity = v;
+        if let Some(v) = get("LN_LANGLE") {
+            m.light_angle = v;
         }
-        if let Some(v) = get("LN_TINT") {
-            m.tint_amount = v;
+        if let Some(v) = get("LN_OPACITY") {
+            m.opacity = v;
         }
         m
     }
 
     pub fn zero() -> Self {
         Self {
-            refractive_index: 0.0,
-            surface_tension_falloff: 0.0,
-            chromatic_dispersion: 0.0,
-            frost_blur_radius: 0.0,
-            height_scale: 0.0,
-            specular_intensity: 0.0,
-            rim_intensity: 0.0,
-            tint_amount: 0.0,
+            refraction: 0.0,
+            depth: 0.0,
+            frost: 0.0,
+            border_refract: 0.0,
+            lighting: 0.0,
             ..Self::default()
         }
     }

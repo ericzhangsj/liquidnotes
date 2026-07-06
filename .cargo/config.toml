@@ -1,0 +1,6 @@
+# Statically link the MSVC C runtime for release/CI builds so the shipped
+# liquidnotes.exe is a single self-contained file with no VC++ redistributable
+# dependency. Only affects the MSVC target (CI + `cargo build` on a stock
+# Windows Rust install); the local GNU toolchain build is left untouched.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
