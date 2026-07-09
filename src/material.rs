@@ -15,9 +15,10 @@ pub struct GlassMaterial {
     pub border_thickness: f32,
     /// Extra refraction at the rim (0 = none).
     pub border_refract: f32,
-    /// Blinn-Phong rim glint intensity (0.0 = off).
+    /// Fresnel rim intensity (0.0 = off): a razor-thin white edge highlight
+    /// that hugs the whole border uniformly (view-angle based, no corner bias).
     pub lighting: f32,
-    /// Light azimuth in degrees (where the rim glint sits).
+    /// Unused (kept for env-override/serialization compatibility).
     pub light_angle: f32,
     /// Adaptive card-fill amount, 0..1 (0.0 = clear glass, 1.0 = solid card).
     /// The fill colour auto-opposes the desktop: dark grey over light, white
@@ -32,11 +33,11 @@ impl Default for GlassMaterial {
             depth: 0.5,
             frost: 3.9,
             corner_radius: 32.0,
-            border_thickness: 2.3,
-            border_refract: 1.0,
-            lighting: 0.0,
+            border_thickness: 2.7,
+            border_refract: 0.7,
+            lighting: 0.35,
             light_angle: 135.0,
-            opacity: 0.2,
+            opacity: 0.25,
         }
     }
 }

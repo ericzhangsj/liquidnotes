@@ -38,6 +38,9 @@ pub struct Capture {
     /// Bounding box (virtual-desktop coords) of everything copied last tick,
     /// so the app can re-render only the notes it actually touched.
     pub dirty_bounds: Option<RECT>,
+    /// Coarse CPU-readable luminance of the backdrop, for time-based per-note
+    /// colour decisions (the shader can't remember state across frames).
+    probe: LumProbe,
 }
 
 impl Capture {
@@ -84,6 +87,8 @@ impl Capture {
             gpu.device
                 .CreateShaderResourceView(&background, None, Some(&mut srv))?;
 
+            let probe = LumProbe::new(&gpu.device, width, height)?;
+
             Ok(Self {
                 device: gpu.device.clone(),
                 context: gpu.context.clone(),
@@ -101,8 +106,26 @@ impl Capture {
                 cursor_pos: (0, 0),
                 cursor_visible: false,
                 dirty_bounds: None,
+                probe,
             })
         }
+    }
+
+    /// Refresh the coarse CPU luminance grid from the current backdrop. One
+    /// GPU box-filter + small read-back; call it on a throttle (~90 ms), not
+    /// every frame.
+    pub fn update_lum(&mut self) {
+        self.probe.update(&self.context, &self.background);
+    }
+
+    /// Average backdrop luminance (0..1) under a virtual-desktop rect. 0.5 until
+    /// the first `update_lum`.
+    pub fn lum_at(&self, rect: RECT) -> f32 {
+        let x0 = (rect.left - self.origin.0).clamp(0, self.width as i32);
+        let y0 = (rect.top - self.origin.1).clamp(0, self.height as i32);
+        let x1 = (rect.right - self.origin.0).clamp(0, self.width as i32);
+        let y1 = (rect.bottom - self.origin.1).clamp(0, self.height as i32);
+        self.probe.avg_lum(x0, y0, x1, y1, self.width, self.height)
     }
 
     /// Pump pending duplication frames into `background`, skipping `exclude`
@@ -311,8 +334,15 @@ impl Capture {
     /// drop-shadow), or None when the pointer is hidden. The glass shader keeps
     /// its refraction/blur samples out of this rect so the baked-in pointer is
     /// never sampled.
+    ///
+    /// DISABLED (`CURSOR_AVOID` = false): steering samples out of the cursor
+    /// rect draws a visible "box" in the refraction under the pointer. It only
+    /// mattered on drivers that bake the pointer into the duplicated frame;
+    /// modern Windows delivers the cursor separately, so it's pure artifact
+    /// there. Flip `CURSOR_AVOID` back to true if a ghost cursor ever appears.
     pub fn cursor_rect(&self) -> Option<RECT> {
-        if !self.cursor_visible {
+        let cursor_avoid = false; // flip to true to re-enable pointer avoidance
+        if !cursor_avoid || !self.cursor_visible {
             return None;
         }
         let cw = self.cursor_w.max(1) as i32;
@@ -336,14 +366,15 @@ impl Capture {
         self.seeded
     }
 
-    /// Diagnostic only: block until an image-bearing frame arrives and copy
-    /// ALL of it into `background`, no dirty rects, no masking.
+    /// Blocking seed for a static screen: wait for an image-bearing frame and
+    /// copy ALL of it into `background` (no dirty rects, no masking). Used once
+    /// at startup when the incremental `tick` path hasn't caught a frame yet.
     pub fn force_full_refresh(&mut self, timeout_ms: u32) -> Result<()> {
         let dupl = self
             .dupl
             .as_ref()
             .ok_or_else(|| Error::new(E_FAIL, "duplication not live"))?;
-        for attempt in 0..20 {
+        for _ in 0..20 {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             unsafe { dupl.AcquireNextFrame(timeout_ms, &mut info, &mut resource) }?;
@@ -360,11 +391,6 @@ impl Capture {
                 self.context.Flush();
                 dupl.ReleaseFrame()?;
             }
-            println!(
-                "force_full_refresh: got image frame on attempt {attempt}, \
-                 AccumulatedFrames={}",
-                info.AccumulatedFrames
-            );
             self.seeded = true;
             return Ok(());
         }
@@ -409,4 +435,135 @@ fn subtract_rect(r: RECT, holes: &[RECT]) -> Vec<RECT> {
         }
     }
     pieces
+}
+
+/// Coarse CPU-side luminance of the backdrop. A full-res mip-chained copy is
+/// box-filtered down on the GPU (`GenerateMips`); one small level is read back
+/// into a staging texture so the CPU can average the luminance under any note.
+struct LumProbe {
+    mip: ID3D11Texture2D,
+    mip_srv: ID3D11ShaderResourceView,
+    stage: ID3D11Texture2D,
+    /// Mip level read back (the one ~<=96 px on the long axis).
+    level: u32,
+    sw: u32,
+    sh: u32,
+    data: Vec<f32>,
+    ready: bool,
+}
+
+impl LumProbe {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        unsafe {
+            // Full-res texture with a complete mip chain we can box-filter down.
+            let mdesc = D3D11_TEXTURE2D_DESC {
+                Width: width,
+                Height: height,
+                MipLevels: 0, // full chain
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_SHADER_RESOURCE.0 | D3D11_BIND_RENDER_TARGET.0) as u32,
+                CPUAccessFlags: 0,
+                MiscFlags: D3D11_RESOURCE_MISC_GENERATE_MIPS.0 as u32,
+            };
+            let mut mip = None;
+            device.CreateTexture2D(&mdesc, None, Some(&mut mip))?;
+            let mip = mip.unwrap();
+            let mut mip_srv = None;
+            device.CreateShaderResourceView(&mip, None, Some(&mut mip_srv))?;
+
+            // Read back the mip level nearest ~96 px on the long axis.
+            let mut level = 0u32;
+            while (width >> level) > 96 && (width >> level) > 1 {
+                level += 1;
+            }
+            let sw = (width >> level).max(1);
+            let sh = (height >> level).max(1);
+
+            let sdesc = D3D11_TEXTURE2D_DESC {
+                Width: sw,
+                Height: sh,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut stage = None;
+            device.CreateTexture2D(&sdesc, None, Some(&mut stage))?;
+
+            Ok(Self {
+                mip,
+                mip_srv: mip_srv.unwrap(),
+                stage: stage.unwrap(),
+                level,
+                sw,
+                sh,
+                data: vec![0.5; (sw * sh) as usize],
+                ready: false,
+            })
+        }
+    }
+
+    fn update(&mut self, ctx: &ID3D11DeviceContext, background: &ID3D11Texture2D) {
+        unsafe {
+            // Copy the full-res backdrop into mip 0, box-filter down the chain,
+            // then pull the small level into the CPU-readable staging texture.
+            ctx.CopySubresourceRegion(&self.mip, 0, 0, 0, 0, background, 0, None);
+            ctx.GenerateMips(&self.mip_srv);
+            ctx.CopySubresourceRegion(&self.stage, 0, 0, 0, 0, &self.mip, self.level, None);
+            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+            if ctx
+                .Map(&self.stage, 0, D3D11_MAP_READ, 0, Some(&mut m))
+                .is_ok()
+            {
+                let pitch = m.RowPitch as usize;
+                let base = m.pData as *const u8;
+                for y in 0..self.sh as usize {
+                    let row = base.add(y * pitch);
+                    for x in 0..self.sw as usize {
+                        let px = row.add(x * 4); // BGRA
+                        let b = *px as f32;
+                        let g = *px.add(1) as f32;
+                        let r = *px.add(2) as f32;
+                        self.data[y * self.sw as usize + x] =
+                            (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+                    }
+                }
+                ctx.Unmap(&self.stage, 0);
+                self.ready = true;
+            }
+        }
+    }
+
+    /// Mean luminance over an output-local pixel rect (mapped into the grid).
+    fn avg_lum(&self, x0: i32, y0: i32, x1: i32, y1: i32, width: u32, height: u32) -> f32 {
+        if !self.ready {
+            return 0.5;
+        }
+        let sx = self.sw as f32 / width as f32;
+        let sy = self.sh as f32 / height as f32;
+        let gx0 = ((x0 as f32 * sx) as i32).clamp(0, self.sw as i32 - 1);
+        let gx1 = ((x1 as f32 * sx).ceil() as i32).clamp(gx0 + 1, self.sw as i32);
+        let gy0 = ((y0 as f32 * sy) as i32).clamp(0, self.sh as i32 - 1);
+        let gy1 = ((y1 as f32 * sy).ceil() as i32).clamp(gy0 + 1, self.sh as i32);
+        let mut sum = 0.0f32;
+        let mut n = 0u32;
+        for gy in gy0..gy1 {
+            for gx in gx0..gx1 {
+                sum += self.data[(gy * self.sw as i32 + gx) as usize];
+                n += 1;
+            }
+        }
+        if n == 0 {
+            0.5
+        } else {
+            sum / n as f32
+        }
+    }
 }

@@ -24,9 +24,26 @@ pub const A_STRIKE: u8 = 4;
 /// Faint hint shown while a note has no text of its own.
 const PLACEHOLDER: &str = "Type a note…";
 
+/// Inter (variable, SIL OFL) bundled into the exe and loaded via a private
+/// DirectWrite font collection, so the notes render in a real modern sans on
+/// every machine without the font being installed. License: fonts/OFL.txt.
+const INTER_TTF: &[u8] = include_bytes!("../fonts/Inter.ttf");
+/// Family name to request from the private collection.
+const FONT_FAMILY: PCWSTR = w!("Inter");
+
+/// Opacity pill: the 5-level slider track spans this fractional x-range of the
+/// pill width (the label sits to its left). Shared with the click hit-test in
+/// main.rs so a click maps to the same level the knob is drawn at.
+pub const OP_TRACK_L: f32 = 0.40;
+pub const OP_TRACK_R: f32 = 0.92;
+
 pub struct TextRenderer {
     dc: ID2D1DeviceContext,
     dwrite: IDWriteFactory,
+    /// Private font collection holding the bundled Inter face.
+    fonts: IDWriteFontCollection,
+    /// Kept alive for the app's lifetime so the in-memory font stays valid.
+    _font_loader: IDWriteInMemoryFontFileLoader,
     format: IDWriteTextFormat,
     text_brush: ID2D1SolidColorBrush,
     caret_brush: ID2D1SolidColorBrush,
@@ -44,11 +61,12 @@ impl TextRenderer {
             let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            // Helvetica for a clean, modern note face; DirectWrite substitutes
-            // a close sans (Arial / Segoe) if Helvetica isn't installed.
+            // Bundled Inter (a modern sans) in a private collection, so it
+            // renders on every machine without being installed.
+            let (fonts, _font_loader) = Self::load_bundled_font(&dwrite)?;
             let format = dwrite.CreateTextFormat(
-                w!("Helvetica"),
-                None,
+                FONT_FAMILY,
+                &fonts,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
@@ -101,12 +119,39 @@ impl TextRenderer {
             Ok(Self {
                 dc,
                 dwrite,
+                fonts,
+                _font_loader,
                 format,
                 text_brush,
                 caret_brush,
                 placeholder_brush,
                 sel_brush,
             })
+        }
+    }
+
+    /// Load the bundled Inter font into a private DirectWrite collection.
+    /// Returns the collection plus the in-memory loader, which must be kept
+    /// alive alongside it (the collection references fonts served by it).
+    fn load_bundled_font(
+        dwrite: &IDWriteFactory,
+    ) -> Result<(IDWriteFontCollection, IDWriteInMemoryFontFileLoader)> {
+        unsafe {
+            let f5: IDWriteFactory5 = dwrite.cast()?;
+            let loader = f5.CreateInMemoryFontFileLoader()?;
+            f5.RegisterFontFileLoader(&loader)?;
+            let file = loader.CreateInMemoryFontFileReference(
+                dwrite,
+                INTER_TTF.as_ptr() as *const core::ffi::c_void,
+                INTER_TTF.len() as u32,
+                None,
+            )?;
+            let builder: IDWriteFontSetBuilder1 = f5.CreateFontSetBuilder()?.cast()?;
+            builder.AddFontFile(&file)?;
+            let set = builder.CreateFontSet()?;
+            let collection: IDWriteFontCollection =
+                f5.CreateFontCollectionFromFontSet(&set)?.cast()?;
+            Ok((collection, loader))
         }
     }
 
@@ -247,8 +292,8 @@ impl TextRenderer {
             // Dedicated large bold format; centered both ways so the glyph
             // sits dead-center in the button regardless of its size.
             let format = self.dwrite.CreateTextFormat(
-                w!("Helvetica"),
-                None,
+                FONT_FAMILY,
+                &self.fonts,
                 DWRITE_FONT_WEIGHT_BOLD,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
@@ -288,12 +333,12 @@ impl TextRenderer {
     pub fn draw_quit(&self, target: &ID2D1Bitmap1, w: u32, h: u32) -> Result<()> {
         unsafe {
             let format = self.dwrite.CreateTextFormat(
-                w!("Helvetica"),
-                None,
+                FONT_FAMILY,
+                &self.fonts,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                15.0,
+                16.0,
                 w!(""),
             )?;
             let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -342,12 +387,12 @@ impl TextRenderer {
             let track_top = 0.5 * (hf - TRACK_H);
 
             let format = self.dwrite.CreateTextFormat(
-                w!("Helvetica"),
-                None,
+                FONT_FAMILY,
+                &self.fonts,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                14.0,
+                16.0,
                 w!(""),
             )?;
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -411,6 +456,95 @@ impl TextRenderer {
                 },
                 radiusX: KNOB_R,
                 radiusY: KNOB_R,
+            };
+            self.dc.FillEllipse(&knob, &self.text_brush);
+            let _ = self.dc.EndDraw(None, None);
+            self.dc.SetTarget(None);
+        }
+        Ok(())
+    }
+
+    /// Draw the opacity pill: a left-aligned "Opacity" label plus a 5-stop
+    /// slider (dim full track, bright fill up to the knob, five tick dots, a
+    /// round knob at `level` 0..4). All white coverage; the shader inks it.
+    pub fn draw_opacity(&self, target: &ID2D1Bitmap1, w: u32, h: u32, level: u8) -> Result<()> {
+        unsafe {
+            let (wf, hf) = (w as f32, h as f32);
+            let tl = OP_TRACK_L * wf;
+            let tr = OP_TRACK_R * wf;
+            let cy = 0.5 * hf;
+            let t = (level.min(4) as f32) / 4.0;
+            let kx = tl + (tr - tl) * t;
+
+            let format = self.dwrite.CreateTextFormat(
+                FONT_FAMILY,
+                &self.fonts,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                16.0,
+                w!(""),
+            )?;
+            let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            let label: Vec<u16> = "Opacity".encode_utf16().collect();
+            let label_x = 18.0;
+            let layout =
+                self.dwrite
+                    .CreateTextLayout(&label, &format, (tl - 8.0 - label_x).max(1.0), hf)?;
+
+            self.dc.SetTarget(target);
+            let _ = self.dc.BeginDraw();
+            self.dc.Clear(Some(&D2D1_COLOR_F {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            }));
+            self.dc.DrawTextLayout(
+                Vector2 { X: label_x, Y: 0.0 },
+                &layout,
+                &self.text_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+            );
+            // Dim full track.
+            let track = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: tl,
+                    top: cy - 1.5,
+                    right: tr,
+                    bottom: cy + 1.5,
+                },
+                radiusX: 1.5,
+                radiusY: 1.5,
+            };
+            self.dc.FillRoundedRectangle(&track, &self.sel_brush);
+            // Bright fill from the left up to the knob.
+            let filled = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: tl,
+                    top: cy - 1.5,
+                    right: (kx).max(tl + 0.1),
+                    bottom: cy + 1.5,
+                },
+                radiusX: 1.5,
+                radiusY: 1.5,
+            };
+            self.dc.FillRoundedRectangle(&filled, &self.text_brush);
+            // Five tick dots along the track.
+            for k in 0..5 {
+                let x = tl + (tr - tl) * (k as f32 / 4.0);
+                let dot = D2D1_ELLIPSE {
+                    point: Vector2 { X: x, Y: cy },
+                    radiusX: 1.6,
+                    radiusY: 1.6,
+                };
+                self.dc.FillEllipse(&dot, &self.sel_brush);
+            }
+            // Knob at the current level.
+            let knob = D2D1_ELLIPSE {
+                point: Vector2 { X: kx, Y: cy },
+                radiusX: 6.0,
+                radiusY: 6.0,
             };
             self.dc.FillEllipse(&knob, &self.text_brush);
             let _ = self.dc.EndDraw(None, None);

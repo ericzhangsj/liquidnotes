@@ -40,6 +40,7 @@ pub struct GlassRenderer {
     vs: ID3D11VertexShader,
     ps_glass: ID3D11PixelShader,
     ps_blur: ID3D11PixelShader,
+    ps_shadow: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
     cbuf: ID3D11Buffer,
     text: TextRenderer,
@@ -104,6 +105,10 @@ impl GlassRenderer {
             let mut ps_blur = None;
             gpu.device
                 .CreatePixelShader(blob_bytes(&blb), None, Some(&mut ps_blur))?;
+            let shb = compile_shader(src, s!("psshadow"), s!("ps_5_0"))?;
+            let mut ps_shadow = None;
+            gpu.device
+                .CreatePixelShader(blob_bytes(&shb), None, Some(&mut ps_shadow))?;
 
             let sdesc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
@@ -136,6 +141,7 @@ impl GlassRenderer {
                 vs: vs.unwrap(),
                 ps_glass: ps_glass.unwrap(),
                 ps_blur: ps_blur.unwrap(),
+                ps_shadow: ps_shadow.unwrap(),
                 sampler: sampler.unwrap(),
                 cbuf: cbuf.unwrap(),
                 text,
@@ -218,6 +224,12 @@ impl GlassRenderer {
         self.text.draw_startup(&s.text_bitmap, s.width, s.height, on)
     }
 
+    /// Draw the opacity pill's label + 5-stop slider onto its text texture.
+    pub fn draw_opacity(&self, s: &Surface, level: u8) -> Result<()> {
+        self.text
+            .draw_opacity(&s.text_bitmap, s.width, s.height, level)
+    }
+
     /// Map a note-local point to a caret position (UTF-16 units) in `text`.
     pub fn hit_test_text(&self, s: &Surface, text: &str, font_size: f32, x: f32, y: f32) -> u32 {
         self.text.hit_test(s.width, s.height, text, font_size, x, y)
@@ -226,6 +238,30 @@ impl GlassRenderer {
     /// Laid-out height (px) of `text` at `font_size` in a `max_w`-wide column.
     pub fn measure_text(&self, text: &str, max_w: f32, font_size: f32) -> f32 {
         self.text.measure(text, max_w, font_size)
+    }
+
+    /// Fill a note's companion window surface with a soft symmetric drop shadow
+    /// (a note-shaped rounded rect inset by `margin`, falling off over that
+    /// margin at `opacity`). Rendered once per size change, not per frame; the
+    /// bound SRVs are unused by psshadow (its own texture SRV stands in).
+    pub fn render_shadow(
+        &self,
+        s: &mut Surface,
+        corner_radius: f32,
+        margin: f32,
+        opacity: f32,
+    ) -> Result<()> {
+        let (w, h) = (s.width, s.height);
+        let p = Params {
+            pane: [w as f32, h as f32, 0.0, 0.0],
+            shape: [corner_radius, margin, opacity, 0.0],
+            ..Default::default()
+        };
+        let rtv = s.rtv.clone().expect("surface has no rtv");
+        let srv = s.text_srv.clone();
+        self.pass(&self.ps_shadow, &rtv, &srv, Some(&srv), Some(&srv), w, h, &p)?;
+        unsafe { s.swapchain.Present(0, DXGI_PRESENT(0)).ok()? }
+        Ok(())
     }
 
     /// Note-local caret geometry `(x, line_top_y, line_height)` for a UTF-16
@@ -449,6 +485,7 @@ impl GlassRenderer {
         reveal: f32,
         glow: f32,
         active: f32,
+        cmix: f32,
     ) -> Result<()> {
         let (w, h) = (s.width, s.height);
         let desk = [
@@ -489,12 +526,17 @@ impl GlassRenderer {
             ],
             refr: [eta, q, mat.border_refract, mat.border_thickness],
             cursor,
-            light: [mat.lighting, mat.light_angle.to_radians(), 0.6, mat.opacity],
+            light: [
+                mat.lighting,
+                mat.light_angle.to_radians(),
+                0.0,
+                mat.opacity,
+            ],
             fx: [
                 reveal.clamp(0.0, 1.0),
                 glow.clamp(0.0, 1.0),
                 active.clamp(0.0, 1.0),
-                0.0,
+                cmix.clamp(0.0, 1.0),
             ],
             ..Default::default()
         };

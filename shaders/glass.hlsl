@@ -22,7 +22,7 @@ cbuffer Params : register(b0) {
     float4 frost;  // sigma | margin offset px | 1/blurTexW, 1/blurTexH
     float4 cursor; // minU, minV, maxU, maxV  (>=2 means "no pointer")
     float4 blur;   // sigma | radius texels | dir x, y   (psblur only)
-    float4 light;  // intensity | angle rad | elevation rad | opacity (psglass only)
+    float4 light;  // fresnel rim intensity | screen-light azimuth rad (per-note) | (unused) | opacity
     float4 fx;     // reveal | snap glow | active (fill opacity bump) | spare (psglass only)
 };
 
@@ -134,6 +134,16 @@ float4 psglass(VSO i) : SV_Target {
     // border reads as a thicker, distinct lens. Confined to `border_width` px.
     float rimZone = 1.0 - smoother(0.0, max(bw, 1.0), depth);
     float2 disp = N.xy * eta * (1.0 + bref * rimZone);
+    // Anti-fold cap: at the steep rim the raw displacement can exceed the
+    // distance to the edge, which folds the backdrop mapping back on itself and
+    // shows an inverted (upside-down) sliver at the border. Soft-limit |disp|
+    // (tanh) to a contour-uniform cap so the mapping stays monotonic — the
+    // gentle center displacement is untouched, only the runaway rim is tamed.
+    float dl = length(disp);
+    if (dl > 1e-4) {
+        float cap = min(0.45 * band, 0.75 * (rad + depth));
+        disp *= (max(cap, 1.0) * tanh(dl / max(cap, 1.0))) / dl;
+    }
 
     // Single-tap refraction (one eta for all channels -> white refracts white),
     // steered out of the pointer rect.
@@ -141,64 +151,79 @@ float4 psglass(VSO i) : SV_Target {
     float2 sampUV = avoidCursor(baseUV - disp * src.zw, cursor);
     float3 col = srcTex.Sample(samp, sampUV).rgb;
 
-    // Frost eased in over the rim zone (sharp rim, frosted interior).
-    // blurTex is already pointer-free (psblur avoids the cursor).
-    float blurMix = (frost.x > 0.05) ? smoother(0.0, max(bw, 1.0), depth) : 0.0;
+    // Frost the interior; ALSO strongly blur the BORDER (rim). blurTex is
+    // already pointer-free (psblur avoids the cursor).
+    float interiorFrost = smoother(0.0, max(bw, 1.0), depth);
+    float blurMix = (frost.x > 0.05) ? max(interiorFrost, rimZone) : 0.0;
     if (blurMix > 0.0001) {
         float2 buv = (i.uv * size + frost.yy) * frost.zw - disp * frost.zw;
-        col = lerp(col, blurTex.Sample(samp, buv).rgb, blurMix);
+        float3 bcol = blurTex.Sample(samp, buv).rgb;
+        // Super blur at the rim: a wide extra-tap average of the already-frosted
+        // backdrop, weighted in by rimZone, so the border reads heavily blurred.
+        if (rimZone > 0.01) {
+            float2 px = frost.zw;
+            float R = 10.0;
+            float3 acc = bcol
+                + blurTex.Sample(samp, buv + float2(R, 0.0) * px).rgb
+                + blurTex.Sample(samp, buv - float2(R, 0.0) * px).rgb
+                + blurTex.Sample(samp, buv + float2(0.0, R) * px).rgb
+                + blurTex.Sample(samp, buv - float2(0.0, R) * px).rgb
+                + blurTex.Sample(samp, buv + float2(R, R) * px).rgb
+                + blurTex.Sample(samp, buv - float2(R, R) * px).rgb
+                + blurTex.Sample(samp, buv + float2(R, -R) * px).rgb
+                + blurTex.Sample(samp, buv - float2(R, -R) * px).rgb;
+            bcol = lerp(bcol, acc / 9.0, rimZone);
+        }
+        col = lerp(col, bcol, blurMix);
     }
 
-    // Adaptive card fill: average the backdrop luminance across the whole note
-    // (coarse 4x4 grid, pointer-avoided) once, then tint the glass to OPPOSE the
-    // desktop so the note always stands out — dark VS Code grey over a light
-    // desktop, near-white over a dark one. Amount is the opacity knob (light.w),
-    // bumped +20% while the note is proximity-active (fx.z) so a hovered note
-    // simply reads a touch more solid; an idle note is pixel-identical to before.
-    float bgLum = 0.0;
-    [unroll] for (int gy = 0; gy < 4; ++gy) {
-        [unroll] for (int gx = 0; gx < 4; ++gx) {
-            float2 guv = (float2(gx, gy) + 0.5) * 0.25;
-            float2 buv = avoidCursor((pane.zw + guv * size) * src.zw, cursor);
-            bgLum += dot(srcTex.Sample(samp, buv).rgb, float3(0.2126, 0.7152, 0.0722));
-        }
-    }
-    bgLum *= 0.0625; // / 16
-    float3 fillCol = (bgLum > 0.5) ? float3(0.118, 0.118, 0.118)   // VS Code dark
-                                   : float3(0.97, 0.97, 0.98);      // near white
+    // Adaptive card fill that MATCHES the backdrop darkness: a dark box over a
+    // dark desktop, a light box over a light one. The dark<->light decision is
+    // made on the CPU (a luminance threshold with a debounce) and delivered as
+    // `mix` in fx.w, already eased over time — so a genuine timed fade plays
+    // when the backdrop crosses the threshold, instead of a per-pixel flip.
+    float mix = saturate(fx.w); // 0 = dark scheme, 1 = light scheme
+    float3 fillCol = lerp(float3(0.10, 0.10, 0.12),   // dark box
+                          float3(0.95, 0.95, 0.97),   // light box
+                          mix);
     float active = fx.z;
     float op = saturate(light.w + 0.20 * active);
     if (op > 0.0001) {
         col = lerp(col, fillCol, op);
     }
 
-    // Blinn-Phong rim glint: a white specular highlight concentrated on the
-    // tilted rim walls (rim ~0 on the flat center, so the interior stays
-    // clear). light.y spins where the glint sits around the border.
+    // Razor-thin white Fresnel rim from the view-angle reflectance
+    // F = (1 - N.V)^p with V = +z, so N.V = N.z. It hugs the steep rim
+    // uniformly all the way around the border (N.z is symmetric, so there is
+    // NO directional or per-corner bias), and the high exponent compresses it
+    // into the outermost sliver. Intensity = the `lighting` knob.
     if (light.x > 0.0001) {
-        float ang = light.y, el = light.z;
-        float3 L = normalize(float3(cos(ang) * cos(el), sin(ang) * cos(el), sin(el)));
-        float3 H = normalize(L + float3(0.0, 0.0, 1.0));
-        float spec = pow(saturate(dot(N, H)), 60.0);      // tight glossy glint
-        float rim  = 1.0 - saturate(N.z);                 // ~0 flat center, ->1 steep rim
-        float glint = light.x * spec * rim;               // angle-controllable white glint
-        glint += light.x * 0.15 * pow(rim, 5.0);          // faint always-on wet-edge fresnel
-        col = saturate(col + glint);
+        // Rim mask from the TRUE signed distance to the border (`-d`, positive
+        // inward), confined to a thin fixed-width band — a bright rim LINE that
+        // does not bleed into the glass. `d` is exactly 0 along the whole
+        // border, rounded corners included, so the rim is uniform there (unlike
+        // the dome's approximate `depth` field, which never reaches 0 on the
+        // corner arcs and so dimmed them).
+        float rimW = 3.0; // rim thickness in px
+        float rimMask = 1.0 - smoother(0.0, rimW, -d);
+        // Weighted toward a screen-space light: brightest on the edge FACING
+        // the light, faint on the far edge. `light.y` is the per-note azimuth to
+        // the light (from the note's screen position), so the bright arc slides
+        // around the border as the note moves — nothing corner-baked.
+        float2 Ldir = float2(cos(light.y), sin(light.y));
+        float2 En = normalize(N.xy + float2(1e-5, 0.0)); // outward edge direction
+        float dirW = 0.5 + 0.5 * dot(En, Ldir);          // 1 facing light, 0 opposite
+        col = saturate(col + light.x * rimMask * (0.2 + 0.8 * dirW));
     }
 
-    // Text ink chosen to contrast the note's OWN surface: base the decision on
-    // the effective luminance behind the glyphs (backdrop blended toward the
-    // fill colour by opacity), so ink stays legible whether the note is glassy
-    // or an opaque card. The text texture holds white coverage (alpha) only.
+    // Text ink CONTRASTS the box (which itself matches the backdrop): white
+    // font on a dark box, near-black font on a light box. Same `mix` band as
+    // the fill so the ink cross-fades in lockstep with the box colour.
     float4 txt = textTex.Sample(samp, i.uv);
     if (txt.a > 0.001) {
-        float fillLum = dot(fillCol, float3(0.2126, 0.7152, 0.0722));
-        float effLum = lerp(bgLum, fillLum, saturate(light.w));
-        // Bias hard toward white ink: the surface must be *very* bright (top
-        // ~25% of luminance) before the text flips to dark, so black ink only
-        // appears over near-white backdrops.
-        float3 ink = (effLum < 0.75) ? float3(0.97, 0.97, 0.98)
-                                     : float3(0.10, 0.10, 0.13);
+        float3 ink = lerp(float3(0.97, 0.97, 0.98),   // white on dark box
+                          float3(0.08, 0.08, 0.10),   // near-black on light box
+                          mix);
         col = lerp(col, ink, txt.a);
     }
 
@@ -240,4 +265,28 @@ float4 psblur(VSO i) : SV_Target {
         wsum += wgt;
     }
     return float4(sqrt(acc / wsum), 1.0);
+}
+
+// Minimal soft drop shadow for a note's companion window (sized note + 2*margin).
+// A note-shaped rounded rect inset by the margin (so full strength sits UNDER
+// the note, hidden by it) with a gentle symmetric falloff outward over the
+// margin — a faint halo around every border, no directional bias.
+// shape = [corner radius | margin px | opacity | -]. Output premultiplied black.
+float4 psshadow(VSO i) : SV_Target {
+    float2 size = pane.xy;
+    float2 p = (i.uv - 0.5) * size;
+    float2 halfsz = 0.5 * size;
+    float S = max(shape.y, 1.0);
+    float2 hz = max(halfsz - S, float2(1.0, 1.0));
+    float rr = min(shape.x, min(hz.x, hz.y));
+    float d = sdrb(p, hz, rr);                     // 0 at the note edge, + outward
+    // Gradient shadow: brightest right at the note border, fading out to
+    // nothing by the outer edge. A soft Gaussian blur times a linear ramp that
+    // reaches 0 at the margin edge (so it truly fades to zero instead of
+    // clipping into a faint band at the window boundary).
+    float sigma = S * 0.8;
+    float a = exp(-d * d / (2.0 * sigma * sigma)) * (1.0 - saturate(d / S)) * shape.z;
+    float n = frac(52.9829189 * frac(dot(i.pos.xy, float2(0.06711056, 0.00583715))));
+    a = saturate(a + (n - 0.5) / 255.0);
+    return float4(0.0, 0.0, 0.0, a);               // premultiplied translucent black
 }
