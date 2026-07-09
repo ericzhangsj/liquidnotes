@@ -16,24 +16,17 @@ the glass engine.
 ## Install
 
 1. Download `liquidnotes.exe` from the [**Releases**](../../releases) page.
-2. Double-click it. There's nothing to install — the notes save themselves to
-   `%APPDATA%\liquidnotes\notes.json`, and you can move or delete the `.exe`
-   freely.
 
-> **First run:** because the build isn't code-signed, Windows SmartScreen may
-> show *"Windows protected your PC."* Click **More info → Run anyway**. This is
-> normal for small open-source apps.
-
-To have it start with Windows, right-click the ➕ button → toggle **Launch on
-startup** (writes an `HKCU\...\Run` entry; toggle it off to remove).
+To have it start with Windows, right-click the + button → toggle **Launch on
+startup**
 
 ## Using it
 
-A glass ➕ button sits at the bottom-right of the screen:
+A glass + button sits at the bottom-right of the screen:
 
-- **Left-click ➕** (or press **Win+Shift+N**, or left-click the tray icon) —
-  spawn a new note, stacked above the button.
-- **Right-click ➕** — a pill menu fans out: **Quit**, and a **Launch on
+- **Left-click +** (or press **Win+Shift+N**, or left-click the tray icon)
+  spawns a new note, stacked above the button.
+- **Right-click +** a pill menu fans out: **Quit**, and a **Launch on
   startup** toggle.
 
 Notes:
@@ -114,7 +107,7 @@ Until a settings UI lands, the glass is tunable live via environment variables
 | `LN_BREFRACT` | Extra refraction at the rim |
 | `LN_LIGHT` | Rim glint intensity. `0` = off |
 | `LN_LANGLE` | Rim glint angle (degrees) |
-| `LN_OPACITY` | Adaptive card-fill amount, `0`–`1` (`0` = clear glass) |
+| `LN_OPACITY` | Adaptive card-fill amount, `0`-`1` (`0` = clear glass) |
 | `LN_BACKDROP` | `capture` forces reconstruction mode (notes visible in screenshots) |
 
 Example: `$env:LN_FROST=8; $env:LN_OPACITY=0.3; .\liquidnotes.exe`
