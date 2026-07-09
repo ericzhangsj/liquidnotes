@@ -1,4 +1,6 @@
 /target
+# Local copy of the built app that we keep in the folder for easy launching.
+*.exe
 *.png.tmp
 
 # Personal dev helper with a machine-specific toolchain path (see README for
