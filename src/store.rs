@@ -22,6 +22,11 @@ pub struct NoteData {
 pub struct Store {
     pub version: u32,
     pub next_id: u64,
+    /// Manual size-slider multiplier (1.0 = auto/DPI only).
+    pub user_scale: f32,
+    /// Effective UI scale (display DPI × user_scale) the note pixels below were
+    /// laid out at, so a load on a different-DPI display can rescale them.
+    pub layout_scale: f32,
     pub notes: Vec<NoteData>,
 }
 
@@ -30,6 +35,8 @@ impl Default for Store {
         Store {
             version: 1,
             next_id: 1,
+            user_scale: 1.0,
+            layout_scale: 1.0,
             notes: Vec::new(),
         }
     }
@@ -92,8 +99,11 @@ pub(crate) fn save_atomic_to(path: &Path, store: &Store) -> std::io::Result<()> 
 pub(crate) fn to_json(store: &Store) -> String {
     let mut s = String::with_capacity(64 + store.notes.len() * 128);
     s.push_str(&format!(
-        "{{\"version\":{},\"next_id\":{},\"notes\":[",
-        store.version, store.next_id
+        "{{\"version\":{},\"next_id\":{},\"user_scale\":{},\"layout_scale\":{},\"notes\":[",
+        store.version,
+        store.next_id,
+        fmt_f32(store.user_scale),
+        fmt_f32(store.layout_scale)
     ));
     for (i, n) in store.notes.iter().enumerate() {
         if i > 0 {
@@ -421,6 +431,18 @@ pub(crate) fn parse(s: &str) -> Option<Store> {
         .and_then(|v| v.int())
         .and_then(|v| u64::try_from(v).ok())
         .unwrap_or(1);
+    let user_scale = root
+        .get("user_scale")
+        .and_then(|v| v.num())
+        .map(|v| v as f32)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(1.0);
+    let layout_scale = root
+        .get("layout_scale")
+        .and_then(|v| v.num())
+        .map(|v| v as f32)
+        .filter(|v| *v > 0.0)
+        .unwrap_or(1.0);
 
     let mut notes = Vec::new();
     if let Some(Json::Arr(items)) = root.get("notes") {
@@ -433,6 +455,8 @@ pub(crate) fn parse(s: &str) -> Option<Store> {
     Some(Store {
         version,
         next_id,
+        user_scale,
+        layout_scale,
         notes,
     })
 }
@@ -494,6 +518,8 @@ mod tests {
         Store {
             version: 1,
             next_id: 7,
+            user_scale: 1.25,
+            layout_scale: 1.5,
             notes: vec![
                 NoteData {
                     id: 1,

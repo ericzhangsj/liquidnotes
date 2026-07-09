@@ -12,8 +12,14 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGISurface};
 use windows_numerics::Vector2;
 
-/// Padding (px) from the note edge to the text block.
+/// Padding (px) from the note edge to the text block, at 100% scale.
 pub const PAD: f32 = 22.0;
+
+/// The text inset scaled for the current UI scale, so text keeps the same
+/// proportional margin on a high-DPI (larger-pixel) note.
+fn pad() -> f32 {
+    crate::scale::scf(PAD)
+}
 
 /// Per-character style bits, stored as one `u8` mask per char in a buffer
 /// kept strictly parallel to the note's text.
@@ -198,8 +204,8 @@ impl TextRenderer {
             let layout = self.dwrite.CreateTextLayout(
                 &utf16,
                 &self.format,
-                (w as f32 - 2.0 * PAD).max(1.0),
-                (h as f32 - 2.0 * PAD).max(1.0),
+                (w as f32 - 2.0 * pad()).max(1.0),
+                (h as f32 - 2.0 * pad()).max(1.0),
             )?;
             // Per-note size overrides the base format on this layout only.
             let _ = layout.SetFontSize(
@@ -227,13 +233,13 @@ impl TextRenderer {
                     // First call sizes the metrics buffer (fails with
                     // E_NOT_SUFFICIENT_BUFFER but writes the needed count).
                     let mut count = 0u32;
-                    let _ = layout.HitTestTextRange(s0, s1 - s0, PAD, PAD, None, &mut count);
+                    let _ = layout.HitTestTextRange(s0, s1 - s0, pad(), pad(), None, &mut count);
                     if count > 0 {
                         let mut rects =
                             vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
                         let mut got = 0u32;
                         if layout
-                            .HitTestTextRange(s0, s1 - s0, PAD, PAD, Some(&mut rects), &mut got)
+                            .HitTestTextRange(s0, s1 - s0, pad(), pad(), Some(&mut rects), &mut got)
                             .is_ok()
                         {
                             for m in &rects[..got.min(count) as usize] {
@@ -250,7 +256,7 @@ impl TextRenderer {
                 }
             }
             self.dc.DrawTextLayout(
-                Vector2 { X: PAD, Y: PAD },
+                Vector2 { X: pad(), Y: pad() },
                 &layout,
                 if empty {
                     &self.placeholder_brush
@@ -267,8 +273,8 @@ impl TextRenderer {
                     .HitTestTextPosition(caret_utf16, false, &mut cx, &mut cy, &mut m)
                     .is_ok()
                 {
-                    let x = PAD + cx;
-                    let y = PAD + cy;
+                    let x = pad() + cx;
+                    let y = pad() + cy;
                     let rect = D2D_RECT_F {
                         left: x,
                         top: y,
@@ -464,10 +470,17 @@ impl TextRenderer {
         Ok(())
     }
 
-    /// Draw the opacity pill: a left-aligned "Opacity" label plus a 5-stop
+    /// Draw a settings slider pill: a left-aligned `label_txt` plus a 5-stop
     /// slider (dim full track, bright fill up to the knob, five tick dots, a
     /// round knob at `level` 0..4). All white coverage; the shader inks it.
-    pub fn draw_opacity(&self, target: &ID2D1Bitmap1, w: u32, h: u32, level: u8) -> Result<()> {
+    fn draw_slider(
+        &self,
+        target: &ID2D1Bitmap1,
+        w: u32,
+        h: u32,
+        label_txt: &str,
+        level: u8,
+    ) -> Result<()> {
         unsafe {
             let (wf, hf) = (w as f32, h as f32);
             let tl = OP_TRACK_L * wf;
@@ -486,7 +499,7 @@ impl TextRenderer {
                 w!(""),
             )?;
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            let label: Vec<u16> = "Opacity".encode_utf16().collect();
+            let label: Vec<u16> = label_txt.encode_utf16().collect();
             let label_x = 18.0;
             let layout =
                 self.dwrite
@@ -553,6 +566,16 @@ impl TextRenderer {
         Ok(())
     }
 
+    /// Opacity settings pill (0..4 = 0/25/50/75/100%).
+    pub fn draw_opacity(&self, target: &ID2D1Bitmap1, w: u32, h: u32, level: u8) -> Result<()> {
+        self.draw_slider(target, w, h, "Opacity", level)
+    }
+
+    /// Size settings pill (0..4 = smaller … bigger UI scale).
+    pub fn draw_size(&self, target: &ID2D1Bitmap1, w: u32, h: u32, level: u8) -> Result<()> {
+        self.draw_slider(target, w, h, "Size", level)
+    }
+
     /// Apply per-char style runs to `layout`: consecutive equal masks in
     /// `attrs` (parallel to `text`'s chars) collapse into one DirectWrite
     /// range each, converted to UTF-16 units as we walk.
@@ -606,8 +629,8 @@ impl TextRenderer {
             let Ok(layout) = self.dwrite.CreateTextLayout(
                 &utf16,
                 &self.format,
-                (w as f32 - 2.0 * PAD).max(1.0),
-                (h as f32 - 2.0 * PAD).max(1.0),
+                (w as f32 - 2.0 * pad()).max(1.0),
+                (h as f32 - 2.0 * pad()).max(1.0),
             ) else {
                 return 0;
             };
@@ -622,7 +645,7 @@ impl TextRenderer {
             let mut inside = BOOL(0);
             let mut m = DWRITE_HIT_TEST_METRICS::default();
             if layout
-                .HitTestPoint(x - PAD, y - PAD, &mut trailing, &mut inside, &mut m)
+                .HitTestPoint(x - pad(), y - pad(), &mut trailing, &mut inside, &mut m)
                 .is_ok()
             {
                 m.textPosition + if trailing.as_bool() { 1 } else { 0 }
@@ -651,8 +674,8 @@ impl TextRenderer {
                 .CreateTextLayout(
                     &utf16,
                     &self.format,
-                    (w as f32 - 2.0 * PAD).max(1.0),
-                    (h as f32 - 2.0 * PAD).max(1.0),
+                    (w as f32 - 2.0 * pad()).max(1.0),
+                    (h as f32 - 2.0 * pad()).max(1.0),
                 )
                 .ok()?;
             let _ = layout.SetFontSize(
@@ -668,7 +691,7 @@ impl TextRenderer {
             layout
                 .HitTestTextPosition(caret_utf16, false, &mut cx, &mut cy, &mut m)
                 .ok()?;
-            Some((PAD + cx, PAD + cy, m.height.max(font_size)))
+            Some((pad() + cx, pad() + cy, m.height.max(font_size)))
         }
     }
 

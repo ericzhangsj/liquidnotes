@@ -230,6 +230,11 @@ impl GlassRenderer {
             .draw_opacity(&s.text_bitmap, s.width, s.height, level)
     }
 
+    /// Draw the size pill's label + 5-stop slider onto its text texture.
+    pub fn draw_size(&self, s: &Surface, level: u8) -> Result<()> {
+        self.text.draw_size(&s.text_bitmap, s.width, s.height, level)
+    }
+
     /// Map a note-local point to a caret position (UTF-16 units) in `text`.
     pub fn hit_test_text(&self, s: &Surface, text: &str, font_size: f32, x: f32, y: f32) -> u32 {
         self.text.hit_test(s.width, s.height, text, font_size, x, y)

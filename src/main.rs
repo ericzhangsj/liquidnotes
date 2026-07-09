@@ -13,6 +13,7 @@ use liquidnotes::gpu::capture::Capture;
 use liquidnotes::gpu::device::Gpu;
 use liquidnotes::gpu::glass::{GlassRenderer, Surface};
 use liquidnotes::material::GlassMaterial;
+use liquidnotes::scale::{sc, scf, set_ui_scale, ui_scale};
 use liquidnotes::store::{self, NoteData, Store};
 use liquidnotes::text::{A_BOLD, A_ITALIC, A_STRIKE, OP_TRACK_L, OP_TRACK_R, PAD};
 
@@ -71,6 +72,24 @@ const DOCK_SLIVER: f32 = 0.10;
 const DOCK_PEEK: f32 = 0.20;
 /// Vertical gap kept between notes docked on the same edge.
 const DOCK_GAP: i32 = 6;
+
+/// Manual size-slider stops: a multiplier applied on top of the auto-DPI scale
+/// (index 2 = 1.0 = auto only). Lets the user nudge everything bigger/smaller.
+const SIZE_LEVELS: [f32; 5] = [0.8, 0.9, 1.0, 1.2, 1.4];
+
+/// Nearest size-slider level (0..4) for a given `user_scale` multiplier.
+fn size_level_of(user_scale: f32) -> u8 {
+    let mut best = 0u8;
+    let mut bestd = f32::MAX;
+    for (k, &v) in SIZE_LEVELS.iter().enumerate() {
+        let d = (v - user_scale).abs();
+        if d < bestd {
+            bestd = d;
+            best = k as u8;
+        }
+    }
+    best
+}
 /// TrackMouseEvent leave notification (lives in Win32_UI_Controls, which we
 /// don't otherwise need — the message id itself is all we use).
 const WM_MOUSELEAVE: u32 = 0x02A3;
@@ -275,6 +294,11 @@ struct App {
     /// while the menu is open).
     menu_slide: f32,
     menu_slide_to: f32,
+    /// UI scale split into its two factors. `dpi_scale` comes from the display
+    /// (fixed per machine); `user_scale` is the manual size-slider multiplier
+    /// (persisted). Their product is pushed to `scale::set_ui_scale`.
+    dpi_scale: f32,
+    user_scale: f32,
 }
 
 // Single-threaded app; wndproc reaches the state through this pointer.
@@ -296,6 +320,13 @@ fn main() -> Result<()> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
+    // The app renders at real pixels (needed so the glass refraction lines up
+    // with the captured desktop), so it must scale its own UI by the display's
+    // DPI — otherwise everything is tiny on a high-DPI laptop. This is the
+    // auto part; the user's manual size slider multiplies on top (see
+    // apply_scale, loaded from the store below).
+    let dpi_scale = unsafe { GetDpiForSystem() as f32 / 96.0 };
+    set_ui_scale(dpi_scale);
 
     let gpu = Gpu::new()?;
     let mut cap = Capture::new(&gpu)?;
@@ -335,6 +366,8 @@ fn main() -> Result<()> {
         idle_secs: 0.0,
         menu_slide: 0.0,
         menu_slide_to: 0.0,
+        dpi_scale,
+        user_scale: 1.0,
     });
 
     unsafe {
@@ -363,9 +396,10 @@ fn main() -> Result<()> {
         APP = &mut *app;
 
         let wa = work_area();
-        let bx = wa.right - BUTTON_SIZE - 24;
-        let by = wa.bottom - BUTTON_SIZE - 24;
-        app.create_window(bx, by, BUTTON_SIZE, BUTTON_SIZE, true, 0)?;
+        let bs = sc(BUTTON_SIZE);
+        let bx = wa.right - bs - sc(24);
+        let by = wa.bottom - bs - sc(24);
+        app.create_window(bx, by, bs, bs, true, 0)?;
         let _ = ShowWindow(app.windows[0].hwnd, SW_SHOWNOACTIVATE);
         // One shared 90 ms proximity poll for ALL notes, armed on the button.
         let _ = SetTimer(Some(app.windows[0].hwnd), TIMER_PROX, 90, None);
@@ -399,15 +433,26 @@ fn main() -> Result<()> {
         // Restore persisted notes before entering the message loop.
         let saved = store::load();
         app.next_id = saved.next_id.max(1);
+        // Apply the persisted manual size multiplier, then rescale the saved
+        // note pixels from the scale they were written at to the current
+        // effective scale — so opening notes on a higher-DPI display (or after
+        // moving the size slider) brings them back the right physical size.
+        app.user_scale = saved.user_scale;
+        set_ui_scale(app.dpi_scale * app.user_scale);
+        let load_ratio = ui_scale() / saved.layout_scale;
         for n in &saved.notes {
+            let nw = ((n.w as f32 * load_ratio).round() as i32).max(1);
+            let nh = ((n.h as f32 * load_ratio).round() as i32).max(1);
+            let sx = (n.x as f32 * load_ratio).round() as i32;
+            let sy = (n.y as f32 * load_ratio).round() as i32;
             // A note saved on a now-disconnected monitor comes back on-screen
             // (docked notes recompute from the current work area below).
             let (nx, ny) = if n.docked == 0 {
-                clamp_to_desktop(n.x, n.y, n.w, n.h)
+                clamp_to_desktop(sx, sy, nw, nh)
             } else {
-                (n.x, n.y)
+                (sx, sy)
             };
-            if app.create_window(nx, ny, n.w, n.h, false, n.id).is_ok() {
+            if app.create_window(nx, ny, nw, nh, false, n.id).is_ok() {
                 let i = app.windows.len() - 1;
                 let (chars, attrs) = parse_html(&n.text);
                 let w = &mut app.windows[i];
@@ -417,7 +462,7 @@ fn main() -> Result<()> {
                 w.free = n.free;
                 w.docked = n.docked;
                 w.color = n.color;
-                w.font_size = n.font_size;
+                w.font_size = n.font_size * load_ratio;
                 app.update_text(i);
                 // A note saved docked comes back as a sliver, recomputed from
                 // the current work area (absorbs screen-size changes).
@@ -718,7 +763,7 @@ impl App {
                 docked: 0,
                 tracking: false,
                 color: 0,
-                font_size: 16.0,
+                font_size: scf(16.0),
                 manual_h: 0,
                 // Fully shown by default: restored notes (and the button)
                 // must not fade in; spawn_note dials reveal down itself.
@@ -766,11 +811,11 @@ impl App {
         // the lowest top edge of any stacked note, so stacked_indices sorts it
         // LAST: it takes the bottom slot and the existing notes rise to make
         // room.
-        let x = br.left - STACK_GAP - NOTE_W;
-        let y = br.bottom - NOTE_H;
+        let x = br.left - sc(STACK_GAP) - sc(NOTE_W);
+        let y = br.bottom - sc(NOTE_H);
         let id = self.next_id;
         self.next_id += 1;
-        if self.create_window(x, y, NOTE_W, NOTE_H, false, id).is_ok() {
+        if self.create_window(x, y, sc(NOTE_W), sc(NOTE_H), false, id).is_ok() {
             let i = self.windows.len() - 1;
             let w = &mut self.windows[i];
             w.free = false;
@@ -823,7 +868,7 @@ impl App {
         // upward (bottom-most / last note first). The notes right-align to the
         // button, so when the + slides (idle-tuck right or menu-slide left) the
         // whole column follows automatically — no extra offset needed here.
-        let col_right = br.left - STACK_GAP;
+        let col_right = br.left - sc(STACK_GAP);
         let mut y = br.bottom;
         for &i in order.iter().rev() {
             let mut r = RECT::default();
@@ -832,7 +877,7 @@ impl App {
             }
             y -= r.bottom - r.top;
             targets.push((i, col_right - (r.right - r.left), y));
-            y -= STACK_GAP;
+            y -= sc(STACK_GAP);
         }
         targets
     }
@@ -874,10 +919,10 @@ impl App {
     /// whole cluster rides together). Called each frame while either animates.
     fn reposition_cluster(&mut self) {
         let wa = work_area();
-        let home_x = wa.right - BUTTON_SIZE - 24;
-        let home_y = wa.bottom - BUTTON_SIZE - 24;
-        let dx = (self.tuck * TUCK_DX as f32).round() as i32
-            - (self.menu_slide * MENU_DX as f32).round() as i32;
+        let home_x = wa.right - sc(BUTTON_SIZE) - sc(24);
+        let home_y = wa.bottom - sc(BUTTON_SIZE) - sc(24);
+        let dx = (self.tuck * sc(TUCK_DX) as f32).round() as i32
+            - (self.menu_slide * sc(MENU_DX) as f32).round() as i32;
         unsafe {
             let _ = SetWindowPos(
                 self.windows[0].hwnd,
@@ -907,7 +952,7 @@ impl App {
         let dh = d.bottom - d.top;
         // Horizontal band of the column (right-aligned to the button's LEFT
         // edge), using the dragged note's width so "just above the stack" counts.
-        let col_right = br.left - STACK_GAP;
+        let col_right = br.left - sc(STACK_GAP);
         let col_left = col_right - (d.right - d.left);
         if !(d.right > col_left && d.left < col_right) {
             return false;
@@ -973,7 +1018,7 @@ impl App {
         let mut y = r.top;
         for &(bt, bb) in &bands {
             if y < bb && y + h > bt {
-                y = bb + DOCK_GAP;
+                y = bb + sc(DOCK_GAP);
             }
         }
         y = y.clamp(wa.top, (wa.bottom - h).max(wa.top));
@@ -992,9 +1037,9 @@ impl App {
     /// docked notes are fixed obstacles (the free note moves fully around them).
     /// Iterated so a whole chain settles; `idx` just triggers it on drop.
     fn resolve_overlap(&mut self, _idx: usize) {
-        const GAP: i32 = 12;
         const ITERS: usize = 160;
-        let half = GAP as f32 * 0.5;
+        let gap = sc(12); // padding kept between notes / from the screen edge
+        let half = gap as f32 * 0.5;
         let wa = work_area();
 
         // Mass-weighted split of a separation between two notes. A note pinned
@@ -1043,7 +1088,7 @@ impl App {
                 .map(|(x, y)| (x as f32, y as f32))
                 .unwrap_or((r.left as f32, r.top as f32));
             if w.free && w.docked == 0 {
-                let g = GAP as f32;
+                let g = gap as f32;
                 let minx = wa.left as f32 + g;
                 let maxx = wa.right as f32 - rw - g;
                 let miny = wa.top as f32 + g;
@@ -1974,6 +2019,10 @@ impl App {
         Store {
             version: 1,
             next_id: self.next_id,
+            user_scale: self.user_scale,
+            // The note pixels above are at the current effective scale; record
+            // it so a later load on a different-DPI display can rescale them.
+            layout_scale: ui_scale(),
             notes,
         }
     }
@@ -2085,13 +2134,13 @@ impl App {
         unsafe {
             let _ = GetWindowRect(note, &mut r);
         }
-        let m = SHADOW_MARGIN;
+        let m = sc(SHADOW_MARGIN);
         let (sx, sy) = (r.left - m, r.top - m);
         let (sw, sh) = (
             (r.right - r.left + 2 * m).max(8),
             (r.bottom - r.top + 2 * m).max(8),
         );
-        let corner = self.mat.corner_radius;
+        let corner = scf(self.mat.corner_radius);
         let renderer = &self.renderer as *const GlassRenderer;
         if let Some(surf) = self.windows[i].shadow_surface.as_mut() {
             if surf.width != sw as u32 || surf.height != sh as u32 {
@@ -2136,6 +2185,10 @@ impl App {
         // corner_radius to half the height, so a 40 px pill auto-rounds to a
         // full capsule); their labels are white coverage the shader inks.
         let mut mat = self.mat;
+        // Corner/border are authored at 100%; scale them so a bigger note stays
+        // proportionally rounded (the shader works in the surface's real px).
+        mat.corner_radius = scf(mat.corner_radius);
+        mat.border_thickness = scf(mat.border_thickness);
         // Screen-space light fixed at the center of the display: each note's
         // rim faces this point, so the bright arc of the Fresnel rim slides
         // around the border as the note is moved across the screen (recomputed
@@ -2212,14 +2265,14 @@ impl App {
             let _ = GetWindowRect(self.windows[i].hwnd, &mut r);
         }
         let (w, cur_h) = (r.right - r.left, r.bottom - r.top);
-        let pad = PAD as i32;
+        let pad = scf(PAD) as i32;
         let content_w = (w - 2 * pad).max(1) as f32;
         let s: String = self.windows[i].text.iter().collect();
         let text_h = self
             .renderer
             .measure_text(&s, content_w, self.windows[i].font_size);
         let desired =
-            (text_h.ceil() as i32 + 2 * pad).max(NOTE_MIN_H.max(self.windows[i].manual_h));
+            (text_h.ceil() as i32 + 2 * pad).max(sc(NOTE_MIN_H).max(self.windows[i].manual_h));
         // Only move when the height really differs — the resulting
         // WM_WINDOWPOSCHANGED re-enters our layout code.
         if (desired - cur_h).abs() > 1 {
@@ -2371,7 +2424,7 @@ impl App {
         // Settings are note-sized boxes stacked UP on the right (right-aligned
         // to the + / screen edge), the same size and glass as the notes; the
         // note column shifts left (compute_stack_targets) so they don't clash.
-        let sx = br.right - NOTE_W;
+        let sx = br.right - sc(NOTE_W);
 
         // Click-catcher across the whole virtual screen: layered at alpha 0
         // (fully transparent but still hit-testable — WS_EX_TRANSPARENT would
@@ -2413,12 +2466,13 @@ impl App {
         // sliding left, then fades in (staggered) — so the two never overlap.
         const SLIDE_DELAY: f32 = 0.26;
         let startup_on = startup_enabled();
-        let specs: [(u8, f32); 3] = [(0, 0.0), (1, 0.05), (2, 0.10)];
+        // Quit, Launch-on-startup, Opacity, then Size on top.
+        let specs: [(u8, f32); 4] = [(0, 0.0), (1, 0.05), (2, 0.10), (3, 0.15)];
         let mut slot_y = br.bottom;
         for &(kind, stagger) in &specs {
-            slot_y -= NOTE_H;
+            slot_y -= sc(NOTE_H);
             let ty = slot_y;
-            if self.create_window(sx, ty, NOTE_W, NOTE_H, false, 0).is_ok() {
+            if self.create_window(sx, ty, sc(NOTE_W), sc(NOTE_H), false, 0).is_ok() {
                 let i = self.windows.len() - 1;
                 let w = &mut self.windows[i];
                 w.is_pill = true;
@@ -2432,7 +2486,7 @@ impl App {
                     let _ = ShowWindow(self.windows[i].hwnd, SW_SHOWNOACTIVATE);
                 }
             }
-            slot_y -= STACK_GAP;
+            slot_y -= sc(STACK_GAP);
         }
         self.menu_open = true;
         // Slide the + (and its notes) left first to open room for the settings.
@@ -2449,8 +2503,8 @@ impl App {
         // toward the +'s HOME slot (right-aligned near the edge), not its
         // current position.
         let wa = work_area();
-        let sx = (wa.right - 24) - NOTE_W;
-        let bottom_slot = (wa.bottom - 24) - NOTE_H;
+        let sx = (wa.right - sc(24)) - sc(NOTE_W);
+        let bottom_slot = (wa.bottom - sc(24)) - sc(NOTE_H);
         for i in 0..self.windows.len() {
             if !self.windows[i].is_pill || self.windows[i].dying {
                 continue;
@@ -2479,10 +2533,12 @@ impl App {
             return;
         }
         let level = (self.mat.opacity * 4.0).round().clamp(0.0, 4.0) as u8;
+        let size_lvl = size_level_of(self.user_scale);
         let w = &self.windows[i];
         let _ = match w.pill_kind {
             0 => self.renderer.draw_quit(&w.surface),
             2 => self.renderer.draw_opacity(&w.surface, level),
+            3 => self.renderer.draw_size(&w.surface, size_lvl),
             _ => self.renderer.draw_startup(&w.surface, w.pill_on),
         };
         self.render_one(i);
@@ -2500,6 +2556,78 @@ impl App {
                 self.render_one(i);
             }
         }
+    }
+
+    /// Set the manual size multiplier from a 0..4 slider level, live-rescale the
+    /// existing notes + button to the new effective scale, refresh the slider
+    /// knob, and persist the choice.
+    fn set_size_level(&mut self, level: u8) {
+        let new_user = SIZE_LEVELS[level.min(4) as usize];
+        if (new_user - self.user_scale).abs() < 1e-4 {
+            return;
+        }
+        let old_eff = ui_scale();
+        self.user_scale = new_user;
+        let new_eff = self.dpi_scale * new_user;
+        set_ui_scale(new_eff);
+        self.rescale_all(new_eff / old_eff);
+        for i in 0..self.windows.len() {
+            if self.windows[i].is_pill && self.windows[i].pill_kind == 3 {
+                self.draw_pill(i);
+            }
+        }
+        self.mark_dirty();
+    }
+
+    /// Multiply every note and the + button by `ratio` (size, font, manual
+    /// height), reusing the normal resize path (SetWindowPos -> the surface
+    /// resize + content redraw), then re-anchor the cluster. Transient menu
+    /// pills are left alone — they're rebuilt at the new scale next open.
+    fn rescale_all(&mut self, ratio: f32) {
+        if (ratio - 1.0).abs() < 1e-3 {
+            return;
+        }
+        for i in 0..self.windows.len() {
+            let is_button = self.windows[i].is_button;
+            if !(is_button || self.windows[i].is_note())
+                || self.windows[i].dying
+                || self.windows[i].closing
+            {
+                continue;
+            }
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(self.windows[i].hwnd, &mut r);
+            }
+            let nw = ((r.right - r.left) as f32 * ratio).round().max(1.0) as i32;
+            let nh = ((r.bottom - r.top) as f32 * ratio).round().max(1.0) as i32;
+            if !is_button {
+                self.windows[i].font_size *= ratio;
+                self.windows[i].manual_h =
+                    (self.windows[i].manual_h as f32 * ratio).round() as i32;
+                self.windows[i].pos_to = None;
+            }
+            unsafe {
+                // Synchronously drives WM_WINDOWPOSCHANGED -> on_moved_or_resized,
+                // which resizes the swapchain and redraws the note text.
+                let _ = SetWindowPos(
+                    self.windows[i].hwnd,
+                    None,
+                    r.left,
+                    r.top,
+                    nw,
+                    nh,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            if is_button {
+                // The + glyph doesn't ride update_text; redraw it at the new size.
+                let _ = self.renderer.draw_plus(&self.windows[i].surface);
+                self.render_one(i);
+            }
+        }
+        // Re-anchor the + to the corner at the new size and repack the stack.
+        self.reposition_cluster();
     }
 }
 
@@ -2668,11 +2796,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !mmi.is_null() {
                 unsafe {
                     (*mmi).ptMinTrackSize = POINT {
-                        x: NOTE_MIN_W,
-                        y: NOTE_MIN_H,
+                        x: sc(NOTE_MIN_W),
+                        y: sc(NOTE_MIN_H),
                     };
                     (*mmi).ptMaxTrackSize = POINT {
-                        x: NOTE_MAX_W,
+                        x: sc(NOTE_MAX_W),
                         y: 100000, // width is capped; height stays free
                     };
                 }
@@ -2690,13 +2818,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     let rp = lparam.0 as *mut RECT;
                     if !rp.is_null() {
                         let rc = unsafe { &mut *rp };
-                        let pad = PAD as i32;
+                        let pad = scf(PAD) as i32;
                         let content_w = ((rc.right - rc.left) - 2 * pad).max(1) as f32;
                         let s: String = app.windows[i].text.iter().collect();
                         let text_h =
                             app.renderer
                                 .measure_text(&s, content_w, app.windows[i].font_size);
-                        let need = (text_h.ceil() as i32 + 2 * pad).max(NOTE_MIN_H);
+                        let need = (text_h.ceil() as i32 + 2 * pad).max(sc(NOTE_MIN_H));
                         if rc.bottom - rc.top < need {
                             // Grow from whichever horizontal edge isn't being
                             // dragged: 3/4/5 = TOP / TOPLEFT / TOPRIGHT.
@@ -3042,9 +3170,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             // Dropped near a work-area edge: dock as a sliver;
                             // anywhere else stays plain free (and undocked).
                             let wa = work_area();
-                            if p.x <= wa.left + DOCK_TRIGGER {
+                            if p.x <= wa.left + sc(DOCK_TRIGGER) {
                                 app.dock_note(d.idx, -1);
-                            } else if p.x >= wa.right - DOCK_TRIGGER {
+                            } else if p.x >= wa.right - sc(DOCK_TRIGGER) {
                                 app.dock_note(d.idx, 1);
                             } else {
                                 // Stays plain free: repel it out of any overlap
@@ -3107,6 +3235,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let frac =
                                 (((p.x - r.left) as f32 - tl) / (tr - tl)).clamp(0.0, 1.0);
                             app.set_opacity_level((frac * 4.0).round() as u8);
+                        }
+                        3 => {
+                            // Size slider: same 0..4 pick as opacity, but it
+                            // live-rescales every note + the button.
+                            let mut p = POINT::default();
+                            let mut r = RECT::default();
+                            unsafe {
+                                let _ = GetCursorPos(&mut p);
+                                let _ = GetWindowRect(hwnd, &mut r);
+                            }
+                            let wf = (r.right - r.left) as f32;
+                            let tl = OP_TRACK_L * wf;
+                            let tr = OP_TRACK_R * wf;
+                            let frac =
+                                (((p.x - r.left) as f32 - tl) / (tr - tl)).clamp(0.0, 1.0);
+                            app.set_size_level((frac * 4.0).round() as u8);
                         }
                         _ => {
                             // Startup toggle: flip the Run entry and redraw so
@@ -3392,8 +3536,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // VK_OEM_PLUS / VK_OEM_MINUS
                 if let Some(i) = app.index_of(hwnd) {
                     if app.windows[i].is_note() && app.focused == Some(i) {
-                        let step = if vk == 0xBB { 1.0 } else { -1.0 };
-                        let size = (app.windows[i].font_size + step).clamp(9.0, 40.0);
+                        let step = if vk == 0xBB { scf(1.0) } else { -scf(1.0) };
+                        let size = (app.windows[i].font_size + step).clamp(scf(9.0), scf(40.0));
                         if size != app.windows[i].font_size {
                             app.windows[i].font_size = size;
                             app.update_text(i);
