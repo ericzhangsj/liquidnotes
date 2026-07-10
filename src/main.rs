@@ -2626,8 +2626,44 @@ impl App {
                 self.render_one(i);
             }
         }
-        // Re-anchor the + to the corner at the new size and repack the stack.
+        // Re-anchor the + to the corner at the new size and repack the stack,
+        // then re-place the open settings pills at the new scale.
         self.reposition_cluster();
+        self.relayout_pills();
+    }
+
+    /// Re-place the open settings pills into their menu column at the current
+    /// scale — the size slider changes the scale while the menu is open, so the
+    /// pills (skipped by rescale_all) get resized and re-stacked here. Each
+    /// SetWindowPos drives on_moved_or_resized, which resizes the pill's surface
+    /// and redraws its (now scaled) label/slider content.
+    fn relayout_pills(&mut self) {
+        if !self.menu_open {
+            return;
+        }
+        let br = self.rect_of(0);
+        let sx = br.right - sc(NOTE_W);
+        let mut slot_y = br.bottom;
+        for i in 0..self.windows.len() {
+            if !self.windows[i].is_pill || self.windows[i].dying || self.windows[i].closing {
+                continue;
+            }
+            slot_y -= sc(NOTE_H);
+            let ty = slot_y;
+            self.windows[i].pos_to = None;
+            unsafe {
+                let _ = SetWindowPos(
+                    self.windows[i].hwnd,
+                    None,
+                    sx,
+                    ty,
+                    sc(NOTE_W),
+                    sc(NOTE_H),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            slot_y -= sc(STACK_GAP);
+        }
     }
 }
 

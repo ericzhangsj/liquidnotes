@@ -344,7 +344,7 @@ impl TextRenderer {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                16.0,
+                crate::scale::scf(16.0),
                 w!(""),
             )?;
             let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -382,15 +382,17 @@ impl TextRenderer {
     pub fn draw_startup(&self, target: &ID2D1Bitmap1, w: u32, h: u32, on: bool) -> Result<()> {
         unsafe {
             let (wf, hf) = (w as f32, h as f32);
+            let s = crate::scale::ui_scale();
             // Toggle geometry: a 34x18 track inset from the right edge, knob
             // circle riding its ends; the label gets everything to its left.
-            const TRACK_W: f32 = 34.0;
-            const TRACK_H: f32 = 18.0;
-            const KNOB_R: f32 = 7.0;
-            const INSET: f32 = 16.0;
-            let track_right = wf - INSET;
-            let track_left = track_right - TRACK_W;
-            let track_top = 0.5 * (hf - TRACK_H);
+            // All scaled by the UI scale so it matches a high-DPI note.
+            let track_w = 34.0 * s;
+            let track_h = 18.0 * s;
+            let knob_r = 7.0 * s;
+            let inset = 16.0 * s;
+            let track_right = wf - inset;
+            let track_left = track_right - track_w;
+            let track_top = 0.5 * (hf - track_h);
 
             let format = self.dwrite.CreateTextFormat(
                 FONT_FAMILY,
@@ -398,16 +400,16 @@ impl TextRenderer {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                16.0,
+                16.0 * s,
                 w!(""),
             )?;
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             let label: Vec<u16> = "Launch on startup".encode_utf16().collect();
-            let label_x = 18.0;
+            let label_x = 18.0 * s;
             let layout = self.dwrite.CreateTextLayout(
                 &label,
                 &format,
-                (track_left - 8.0 - label_x).max(1.0),
+                (track_left - 8.0 * s - label_x).max(1.0),
                 hf,
             )?;
 
@@ -430,10 +432,10 @@ impl TextRenderer {
                     left: track_left,
                     top: track_top,
                     right: track_right,
-                    bottom: track_top + TRACK_H,
+                    bottom: track_top + track_h,
                 },
-                radiusX: 0.5 * TRACK_H,
-                radiusY: 0.5 * TRACK_H,
+                radiusX: 0.5 * track_h,
+                radiusY: 0.5 * track_h,
             };
             if on {
                 // Engaged: light interior fill under the outline + knob.
@@ -449,19 +451,19 @@ impl TextRenderer {
                 self.dc.FillRoundedRectangle(&track, &half);
             }
             self.dc
-                .DrawRoundedRectangle(&track, &self.text_brush, 1.5, None);
+                .DrawRoundedRectangle(&track, &self.text_brush, 1.5 * s, None);
             let knob_cx = if on {
-                track_right - 0.5 * TRACK_H
+                track_right - 0.5 * track_h
             } else {
-                track_left + 0.5 * TRACK_H
+                track_left + 0.5 * track_h
             };
             let knob = D2D1_ELLIPSE {
                 point: Vector2 {
                     X: knob_cx,
                     Y: 0.5 * hf,
                 },
-                radiusX: KNOB_R,
-                radiusY: KNOB_R,
+                radiusX: knob_r,
+                radiusY: knob_r,
             };
             self.dc.FillEllipse(&knob, &self.text_brush);
             let _ = self.dc.EndDraw(None, None);
@@ -483,6 +485,8 @@ impl TextRenderer {
     ) -> Result<()> {
         unsafe {
             let (wf, hf) = (w as f32, h as f32);
+            let s = crate::scale::ui_scale();
+            let th = 1.5 * s; // track half-height
             let tl = OP_TRACK_L * wf;
             let tr = OP_TRACK_R * wf;
             let cy = 0.5 * hf;
@@ -495,15 +499,18 @@ impl TextRenderer {
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
                 DWRITE_FONT_STRETCH_NORMAL,
-                16.0,
+                16.0 * s,
                 w!(""),
             )?;
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             let label: Vec<u16> = label_txt.encode_utf16().collect();
-            let label_x = 18.0;
-            let layout =
-                self.dwrite
-                    .CreateTextLayout(&label, &format, (tl - 8.0 - label_x).max(1.0), hf)?;
+            let label_x = 18.0 * s;
+            let layout = self.dwrite.CreateTextLayout(
+                &label,
+                &format,
+                (tl - 8.0 * s - label_x).max(1.0),
+                hf,
+            )?;
 
             self.dc.SetTarget(target);
             let _ = self.dc.BeginDraw();
@@ -523,24 +530,24 @@ impl TextRenderer {
             let track = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: tl,
-                    top: cy - 1.5,
+                    top: cy - th,
                     right: tr,
-                    bottom: cy + 1.5,
+                    bottom: cy + th,
                 },
-                radiusX: 1.5,
-                radiusY: 1.5,
+                radiusX: th,
+                radiusY: th,
             };
             self.dc.FillRoundedRectangle(&track, &self.sel_brush);
             // Bright fill from the left up to the knob.
             let filled = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F {
                     left: tl,
-                    top: cy - 1.5,
+                    top: cy - th,
                     right: (kx).max(tl + 0.1),
-                    bottom: cy + 1.5,
+                    bottom: cy + th,
                 },
-                radiusX: 1.5,
-                radiusY: 1.5,
+                radiusX: th,
+                radiusY: th,
             };
             self.dc.FillRoundedRectangle(&filled, &self.text_brush);
             // Five tick dots along the track.
@@ -548,16 +555,16 @@ impl TextRenderer {
                 let x = tl + (tr - tl) * (k as f32 / 4.0);
                 let dot = D2D1_ELLIPSE {
                     point: Vector2 { X: x, Y: cy },
-                    radiusX: 1.6,
-                    radiusY: 1.6,
+                    radiusX: 1.6 * s,
+                    radiusY: 1.6 * s,
                 };
                 self.dc.FillEllipse(&dot, &self.sel_brush);
             }
             // Knob at the current level.
             let knob = D2D1_ELLIPSE {
                 point: Vector2 { X: kx, Y: cy },
-                radiusX: 6.0,
-                radiusY: 6.0,
+                radiusX: 6.0 * s,
+                radiusY: 6.0 * s,
             };
             self.dc.FillEllipse(&knob, &self.text_brush);
             let _ = self.dc.EndDraw(None, None);
