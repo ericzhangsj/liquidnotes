@@ -47,8 +47,9 @@ const BUTTON_SIZE: i32 = 64;
 const TUCK_DX: i32 = BUTTON_SIZE / 2 + 24;
 /// Seconds the cursor must stay away from the cluster before it tucks.
 const TUCK_IDLE_SECS: f32 = 2.5;
-/// Cursor distance (px) from the cluster that wakes it back out.
-const TUCK_WAKE_RADIUS: f32 = 80.0;
+/// Cursor distance (px, at 100%) from the + box that wakes it back out — small,
+/// so it only pops out when the cursor is basically on the + itself.
+const TUCK_WAKE_RADIUS: f32 = 8.0;
 /// How far the + (and its notes) slide LEFT when the settings menu opens, to
 /// clear room for the note-sized settings column on the +'s right.
 const MENU_DX: i32 = NOTE_W + STACK_GAP;
@@ -89,6 +90,21 @@ fn size_level_of(user_scale: f32) -> u8 {
         }
     }
     best
+}
+
+/// The 0..1 knob position for a slider pill from the cursor's x within the
+/// pill's track — shared by the slider drag handlers.
+fn slider_frac_at(hwnd: HWND) -> f32 {
+    let mut p = POINT::default();
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut p);
+        let _ = GetWindowRect(hwnd, &mut r);
+    }
+    let wf = (r.right - r.left) as f32;
+    let tl = OP_TRACK_L * wf;
+    let tr = OP_TRACK_R * wf;
+    (((p.x - r.left) as f32 - tl) / (tr - tl)).clamp(0.0, 1.0)
 }
 /// TrackMouseEvent leave notification (lives in Win32_UI_Controls, which we
 /// don't otherwise need — the message id itself is all we use).
@@ -299,6 +315,15 @@ struct App {
     /// (persisted). Their product is pushed to `scale::set_ui_scale`.
     dpi_scale: f32,
     user_scale: f32,
+    /// Set while rescale_all bulk-resizes windows, so the resize handler skips
+    /// its reentrant per-note relayout — rescale_all does one clean layout pass
+    /// at the end instead.
+    rescaling: bool,
+    /// A settings slider (Opacity/Size pill) being dragged: its window index and
+    /// the live knob position (0..1). The knob tracks the cursor while dragging;
+    /// the value is only committed (and snapped to a level) on button-up.
+    slider_drag: Option<usize>,
+    slider_frac: f32,
 }
 
 // Single-threaded app; wndproc reaches the state through this pointer.
@@ -368,6 +393,9 @@ fn main() -> Result<()> {
         menu_slide_to: 0.0,
         dpi_scale,
         user_scale: 1.0,
+        rescaling: false,
+        slider_drag: None,
+        slider_frac: 0.0,
     });
 
     unsafe {
@@ -1256,7 +1284,7 @@ impl App {
             }
             let dx = (r.left - p.x).max(0).max(p.x - r.right) as f32;
             let dy = (r.top - p.y).max(0).max(p.y - r.bottom) as f32;
-            dx.hypot(dy) <= TUCK_WAKE_RADIUS
+            dx.hypot(dy) <= scf(TUCK_WAKE_RADIUS)
         };
         let busy = self.dragging.is_some() || self.focused.is_some() || self.menu_open;
         if near_plus || busy {
@@ -2111,11 +2139,9 @@ impl App {
             return;
         }
         let w = &self.windows[i];
-        let want = w.docked == 0
-            && w.fling.is_none()
-            && !w.closing
-            && !w.dying
-            && w.reveal_to > 0.5;
+        // Docked slivers keep their shadow too, so a note tucked into the border
+        // still reads as floating above the desktop.
+        let want = w.fling.is_none() && !w.closing && !w.dying && w.reveal_to > 0.5;
         if !want {
             if let Some(sh) = self.windows[i].shadow {
                 if self.windows[i].shadow_shown {
@@ -2343,8 +2369,10 @@ impl App {
                 self.update_text(i);
             }
             // Resizing a stacked note repacks the column immediately so the
-            // rest of the stack reflows live under the resize grip.
-            if self.windows[i].is_note()
+            // rest of the stack reflows live under the resize grip — but not
+            // during a bulk rescale, which relays everything out once at the end.
+            if !self.rescaling
+                && self.windows[i].is_note()
                 && !self.windows[i].free
                 && self.windows[i].docked == 0
             {
@@ -2533,13 +2561,24 @@ impl App {
         if i >= self.windows.len() || !self.windows[i].is_pill {
             return;
         }
-        let level = (self.mat.opacity * 4.0).round().clamp(0.0, 4.0) as u8;
-        let size_lvl = size_level_of(self.user_scale);
+        // While dragging a slider, the knob follows the cursor (live frac);
+        // otherwise it sits at the committed value.
+        let dragging = self.slider_drag == Some(i);
         let w = &self.windows[i];
         let _ = match w.pill_kind {
             0 => self.renderer.draw_quit(&w.surface),
-            2 => self.renderer.draw_opacity(&w.surface, level),
-            3 => self.renderer.draw_size(&w.surface, size_lvl),
+            2 => {
+                let frac = if dragging { self.slider_frac } else { self.mat.opacity };
+                self.renderer.draw_opacity(&w.surface, frac)
+            }
+            3 => {
+                let frac = if dragging {
+                    self.slider_frac
+                } else {
+                    size_level_of(self.user_scale) as f32 / 4.0
+                };
+                self.renderer.draw_size(&w.surface, frac)
+            }
             _ => self.renderer.draw_startup(&w.surface, w.pill_on),
         };
         self.render_one(i);
@@ -2572,6 +2611,9 @@ impl App {
         let new_eff = self.dpi_scale * new_user;
         set_ui_scale(new_eff);
         self.rescale_all(new_eff / old_eff);
+        // Bigger notes may now overlap: run the repel once so nothing sits on
+        // top of anything at the new size.
+        self.resolve_overlap(0);
         for i in 0..self.windows.len() {
             if self.windows[i].is_pill && self.windows[i].pill_kind == 3 {
                 self.draw_pill(i);
@@ -2588,6 +2630,9 @@ impl App {
         if (ratio - 1.0).abs() < 1e-3 {
             return;
         }
+        // Suppress the resize handler's per-note relayout during the bulk pass;
+        // we lay everything out once, cleanly, at the end.
+        self.rescaling = true;
         for i in 0..self.windows.len() {
             let is_button = self.windows[i].is_button;
             if !(is_button || self.windows[i].is_note())
@@ -2629,6 +2674,7 @@ impl App {
         }
         // Re-anchor the + to the corner at the new size and repack the stack,
         // then re-place the open settings pills at the new scale.
+        self.rescaling = false;
         self.reposition_cluster();
         self.relayout_pills();
     }
@@ -2642,8 +2688,14 @@ impl App {
         if !self.menu_open {
             return;
         }
+        // Place the pills exactly where open_pill_menu would: anchored to the
+        // +'s HOME rect. The + is currently slid left by (menu_slide * MENU_DX)
+        // to clear room, so undo that on its live rect to recover the home
+        // right edge; its top/bottom don't slide. Using the live (drift-free)
+        // rect this way keeps the column from creeping when the scale changes.
         let br = self.rect_of(0);
-        let sx = br.right - sc(NOTE_W);
+        let slide = (self.menu_slide * sc(MENU_DX) as f32).round() as i32;
+        let sx = (br.right + slide) - sc(NOTE_W);
         let mut slot_y = br.bottom;
         for i in 0..self.windows.len() {
             if !self.windows[i].is_pill || self.windows[i].dying || self.windows[i].closing {
@@ -2943,9 +2995,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Top drag strip of a note: start a manual drag (no focus, no
             // edit). Below the strip: take keyboard focus and edit.
             if let Some(i) = app.index_of(hwnd) {
-                // A pill is neither draggable nor editable — it acts on the
-                // button-up (Quit / toggle), so the press is a no-op.
+                // A Quit/toggle pill acts on button-up (press is a no-op). An
+                // Opacity/Size slider starts a drag: the knob follows the cursor
+                // and the value is committed on release.
                 if app.windows[i].is_pill {
+                    let k = app.windows[i].pill_kind;
+                    if k == 2 || k == 3 {
+                        unsafe {
+                            let _ = SetCapture(hwnd);
+                        }
+                        app.slider_drag = Some(i);
+                        app.slider_frac = slider_frac_at(hwnd);
+                        app.draw_pill(i);
+                    }
                     return LRESULT(0);
                 }
                 if !app.windows[i].is_button {
@@ -3017,6 +3079,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
+            // Dragging a settings slider: the captured pill gets these moves;
+            // slide the knob to the cursor and redraw, but don't commit yet.
+            if let Some(i) = app.slider_drag {
+                app.slider_frac = slider_frac_at(hwnd);
+                app.draw_pill(i);
+                return LRESULT(0);
+            }
             // Mouse text selection in progress: the caret follows the cursor
             // while the anchor (sel) stays put.
             if app.selecting {
@@ -3145,6 +3214,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            // Releasing a settings slider: snap the live knob to the nearest
+            // level and commit it now (this is where opacity/size actually
+            // change, and set_*_level redraws the knob at the snapped spot).
+            if let Some(i) = app.slider_drag.take() {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                let level = (app.slider_frac * 4.0).round().clamp(0.0, 4.0) as u8;
+                if i < app.windows.len() {
+                    match app.windows[i].pill_kind {
+                        2 => app.set_opacity_level(level),
+                        3 => app.set_size_level(level),
+                        _ => {}
+                    }
+                }
+                return LRESULT(0);
+            }
             if let Some(d) = app.dragging.take() {
                 unsafe {
                     let _ = ReleaseCapture();

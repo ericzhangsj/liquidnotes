@@ -224,15 +224,15 @@ impl GlassRenderer {
         self.text.draw_startup(&s.text_bitmap, s.width, s.height, on)
     }
 
-    /// Draw the opacity pill's label + 5-stop slider onto its text texture.
-    pub fn draw_opacity(&self, s: &Surface, level: u8) -> Result<()> {
+    /// Draw the opacity pill's label + slider (`frac` = 0..1 knob position).
+    pub fn draw_opacity(&self, s: &Surface, frac: f32) -> Result<()> {
         self.text
-            .draw_opacity(&s.text_bitmap, s.width, s.height, level)
+            .draw_opacity(&s.text_bitmap, s.width, s.height, frac)
     }
 
-    /// Draw the size pill's label + 5-stop slider onto its text texture.
-    pub fn draw_size(&self, s: &Surface, level: u8) -> Result<()> {
-        self.text.draw_size(&s.text_bitmap, s.width, s.height, level)
+    /// Draw the size pill's label + slider (`frac` = 0..1 knob position).
+    pub fn draw_size(&self, s: &Surface, frac: f32) -> Result<()> {
+        self.text.draw_size(&s.text_bitmap, s.width, s.height, frac)
     }
 
     /// Map a note-local point to a caret position (UTF-16 units) in `text`.

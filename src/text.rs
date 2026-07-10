@@ -481,7 +481,7 @@ impl TextRenderer {
         w: u32,
         h: u32,
         label_txt: &str,
-        level: u8,
+        frac: f32,
     ) -> Result<()> {
         unsafe {
             let (wf, hf) = (w as f32, h as f32);
@@ -490,7 +490,7 @@ impl TextRenderer {
             let tl = OP_TRACK_L * wf;
             let tr = OP_TRACK_R * wf;
             let cy = 0.5 * hf;
-            let t = (level.min(4) as f32) / 4.0;
+            let t = frac.clamp(0.0, 1.0);
             let kx = tl + (tr - tl) * t;
 
             let format = self.dwrite.CreateTextFormat(
@@ -573,14 +573,14 @@ impl TextRenderer {
         Ok(())
     }
 
-    /// Opacity settings pill (0..4 = 0/25/50/75/100%).
-    pub fn draw_opacity(&self, target: &ID2D1Bitmap1, w: u32, h: u32, level: u8) -> Result<()> {
-        self.draw_slider(target, w, h, "Opacity", level)
+    /// Opacity settings pill; `frac` is the 0..1 knob position.
+    pub fn draw_opacity(&self, target: &ID2D1Bitmap1, w: u32, h: u32, frac: f32) -> Result<()> {
+        self.draw_slider(target, w, h, "Opacity", frac)
     }
 
-    /// Size settings pill (0..4 = smaller … bigger UI scale).
-    pub fn draw_size(&self, target: &ID2D1Bitmap1, w: u32, h: u32, level: u8) -> Result<()> {
-        self.draw_slider(target, w, h, "Size", level)
+    /// Size settings pill; `frac` is the 0..1 knob position.
+    pub fn draw_size(&self, target: &ID2D1Bitmap1, w: u32, h: u32, frac: f32) -> Result<()> {
+        self.draw_slider(target, w, h, "Size", frac)
     }
 
     /// Apply per-char style runs to `layout`: consecutive equal masks in
