@@ -187,7 +187,7 @@ float4 psglass(VSO i) : SV_Target {
                           float3(0.95, 0.95, 0.97),   // light box
                           mix);
     float active = fx.z;
-    float op = saturate(light.w + 0.20 * active);
+    float op = saturate(light.w + 0.30 * active);
     if (op > 0.0001) {
         col = lerp(col, fillCol, op);
     }

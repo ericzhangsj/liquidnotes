@@ -46,7 +46,7 @@ const BUTTON_SIZE: i32 = 64;
 /// half the + pokes past the right work-area edge (home right edge is 24 px in).
 const TUCK_DX: i32 = BUTTON_SIZE / 2 + 24;
 /// Seconds the cursor must stay away from the cluster before it tucks.
-const TUCK_IDLE_SECS: f32 = 5.0;
+const TUCK_IDLE_SECS: f32 = 2.5;
 /// Cursor distance (px) from the cluster that wakes it back out.
 const TUCK_WAKE_RADIUS: f32 = 80.0;
 /// How far the + (and its notes) slide LEFT when the settings menu opens, to
@@ -1200,10 +1200,10 @@ impl App {
         self.start_anim_timer();
     }
 
-    /// One 90 ms proximity poll: the single nearest note within PROX_RADIUS
-    /// px of the cursor becomes "active" (its card fill firms up +20%); the
-    /// focused note is always active regardless of distance. anim_tick eases
-    /// each note's `active` toward the target this sets.
+    /// One 90 ms proximity poll: the single nearest note or settings pill
+    /// within PROX_RADIUS px of the cursor becomes "active" (its fill firms up
+    /// +30%); the focused note is always active regardless of distance.
+    /// anim_tick eases each window's `active` toward the target this sets.
     fn proximity_tick(&mut self) {
         let mut p = POINT::default();
         unsafe {
@@ -1214,7 +1214,8 @@ impl App {
         let mut nearest: Option<usize> = None;
         let mut best = f32::MAX;
         for i in 0..self.windows.len() {
-            if !self.windows[i].is_note() {
+            // Notes and settings pills both respond to hover; the + does not.
+            if !(self.windows[i].is_note() || self.windows[i].is_pill) {
                 continue;
             }
             let mut r = RECT::default();
@@ -1231,7 +1232,7 @@ impl App {
         }
         let mut wake = false;
         for i in 0..self.windows.len() {
-            if !self.windows[i].is_note() {
+            if !(self.windows[i].is_note() || self.windows[i].is_pill) {
                 continue;
             }
             let to = if self.focused == Some(i) || nearest == Some(i) {
