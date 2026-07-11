@@ -1,49 +1,37 @@
 # liquidnotes
 
-Always-on-top sticky notes for Windows with a **real** liquid-glass material —
-not the OS acrylic/blur. The engine captures the desktop on the GPU (DXGI
-Desktop Duplication), reconstructs a background-only texture, and runs a
-single-pass refraction shader (SDF height field → surface normals → Snell
-refraction → frost → rim light) composited through DirectComposition. Each note
-is its own `WS_EX_NOREDIRECTIONBITMAP` window whose pixels come entirely from
-the glass engine.
-
-- **Single portable `.exe`**, no runtime dependencies, Windows 10 2004+ (x64).
-- Rich-text notes, edge docking, flick-to-delete, launch-on-startup, tray icon.
-- **Zero means zero**: every material knob at `0` renders a pixel-perfect
-  passthrough of the sharp desktop (the note becomes optically invisible).
+Always-on-top sticky notes for Windows with a **real** liquid-glass look — the
+notes refract the live desktop behind them, not a flat blur. One small `.exe`,
+no dependencies.
 
 ## Install
 
-1. Download `liquidnotes.exe` from the [**Releases**](../../releases) page.
+Download `liquidnotes.exe` from the [**Releases**](../../releases) page and run
+it (Windows 10 2004+, 64-bit). A glass **+** button appears at the bottom-right
+of your screen.
 
-To have it start with Windows, right-click the + button → toggle **Launch on
-startup**
+To start it with Windows: right-click the **+** → toggle **Launch on startup**.
 
 ## Using it
 
-A glass + button sits at the bottom-right of the screen:
+- **New note** — left-click the **+** (or press **Win+Shift+N**, or left-click
+  the tray icon). New notes stack above the button.
+- **Move / resize** — drag a note's top strip to move it; pull any edge or
+  corner to resize.
+- **Delete** — flick a note fast and let go: it spins off the screen. Bring the
+  last one back with **Ctrl+Shift+Z**, restored to right where it was.
+- **Dock** — drop a note against the left or right screen edge to tuck it away
+  as a thin sliver; click it to slide it back.
+- **Edit** — click a note's body to type. **Double-click** selects a word,
+  **triple-click** a sentence.
+- **Settings** — right-click the **+** for a pill menu: **Quit**, **Launch on
+  startup**, and **Opacity** / **Size** sliders.
 
-- **Left-click +** (or press **Win+Shift+N**, or left-click the tray icon)
-  spawns a new note, stacked above the button.
-- **Right-click +** a pill menu fans out: **Quit**, and a **Launch on
-  startup** toggle.
-
-Notes:
-
-- **Drag** the top strip to move a note; pull any **edge/corner** to resize.
-- **Flick** a note fast and let go to **throw it away** (delete) — it spins off
-  and can be brought back with **Ctrl+Shift+Z**.
-- Drop a note against the **left/right screen edge** to **dock** it as a thin
-  sliver; hover to peek, click to bring it back.
-- Click a note's body to edit; only the focused note shows a caret.
-- **Double-click** selects the word under the cursor; **triple-click** selects
-  the whole sentence.
-
-### Keyboard shortcuts (while editing a note)
+### Keyboard shortcuts
 
 | Keys | Action |
 |---|---|
+| Double-click / triple-click | Select the word / sentence |
 | Arrows | Move the caret (Up/Down across wrapped lines) |
 | Ctrl+← / Ctrl+→ | Move by word |
 | Home / End | Start / end of the line |
@@ -51,71 +39,39 @@ Notes:
 | Shift + any of the above | Extend the selection |
 | Ctrl+A | Select all |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste |
-| Ctrl+Z / Ctrl+Y | Undo / redo the text edit (within the focused note) |
+| Ctrl+Z / Ctrl+Y | Undo / redo the text edit |
+| Ctrl+Shift+Z | Bring back the last deleted note |
 | Backspace / Delete | Delete a character |
 | Ctrl+Backspace / Ctrl+Delete | Delete a word |
 | Ctrl+B / Ctrl+I | Bold / italic the selection |
-| Ctrl+S | Strikethrough the selection (or save now if nothing is selected) |
+| Ctrl+S | Strikethrough the selection (or force-save if nothing is selected) |
 | Ctrl+= / Ctrl+- | Grow / shrink the note's font |
 | Ctrl+W | Close the note |
 
-**Ctrl+Shift+Z** brings back the most recently deleted note — restored to how
-it lived: at its old spot if it was free-floating, re-docked to the same corner,
-or slotted back into the stack at its original position. Repeat to walk back
-through recent deletions.
+## Under the hood
 
-### Backdrop modes
+You won't really notice any of this — it's just there to look and read nicely:
 
-**Live** (default) keeps video etc. playing under the glass, but hides notes
-from screenshots/recordings. The tray menu's *Live backdrop* toggle switches to
-**reconstruction** mode — notes then show in captures, at the cost of content
-fully hidden under a stationary note freezing until revealed.
+- **Real liquid glass.** The engine captures the desktop on the GPU and runs a
+  refraction shader (curved-surface normals → Snell refraction → frost → rim
+  light) per note, so the glass genuinely bends the live background behind it.
+- **Crisp text.** Note text is rendered supersampled and averaged back down, so
+  glyphs stay sharp on any display.
+- **Invisible in captures.** By default notes stay out of screenshots and screen
+  recordings (the backdrop keeps playing underneath); a tray toggle switches to
+  a mode where they show in captures instead.
 
-## Building from source
-
-Stock Rust on Windows uses the MSVC toolchain (this is what CI ships):
+## Build from source
 
 ```
 rustup default stable
 cargo build --release
 ```
 
-The result is `target\release\liquidnotes.exe`. Release builds statically link
-the C runtime (see `.cargo/config.toml`) so the `.exe` is self-contained.
-Tagged pushes (`v*`) build and attach the `.exe` to a GitHub Release
-automatically (`.github/workflows/release.yml`).
-
-### Without Visual Studio (GNU toolchain)
-
-To build entirely at the user level, without VS Build Tools:
-
-1. `rustup default stable-x86_64-pc-windows-gnu`
-2. Install [w64devkit](https://github.com/skeeto/w64devkit) (portable zip) and
-   put its `bin` on PATH — the `windows` crates use raw-dylib linking, which
-   needs binutils' `dlltool`/`as` that rustup doesn't bundle.
-3. w64devkit ships no `libgcc_eh.a` (its unwinder lives in `libgcc.a`); create
-   an empty stub next to its `libgcc.a`:
-   `ar rcs lib\gcc\x86_64-w64-mingw32\<ver>\libgcc_eh.a`
-
-## Material tuning
-
-Until a settings UI lands, the glass is tunable live via environment variables
-(all default to a tasteful preset; set any to `0` to disable that effect):
-
-| Env var | Effect |
-|---|---|
-| `LN_REFRACT` | How violently the backdrop warps. `0` = refraction off |
-| `LN_DEPTH` | Dome reach, `0`–`1`: higher pushes the curve toward the center |
-| `LN_FROST` | Gaussian frost blur radius. `0` = blur pass skipped |
-| `LN_CORNER` | Corner radius (px) |
-| `LN_BORDER` | Rim/bevel width (px) |
-| `LN_BREFRACT` | Extra refraction at the rim |
-| `LN_LIGHT` | Rim glint intensity. `0` = off |
-| `LN_LANGLE` | Rim glint angle (degrees) |
-| `LN_OPACITY` | Adaptive card-fill amount, `0`-`1` (`0` = clear glass) |
-| `LN_BACKDROP` | `capture` forces reconstruction mode (notes visible in screenshots) |
-
-Example: `$env:LN_FROST=8; $env:LN_OPACITY=0.3; .\liquidnotes.exe`
+Produces a self-contained `target\release\liquidnotes.exe`. Building with the
+GNU toolchain instead of MSVC also needs
+[w64devkit](https://github.com/skeeto/w64devkit) on PATH (for `dlltool` / `as` /
+`windres`).
 
 ## License
 
