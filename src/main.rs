@@ -200,8 +200,10 @@ struct Win {
     closing: bool,
     /// Fade/fling finished; the main loop destroys this window next reap.
     dying: bool,
-    /// Per-note text-edit undo/redo stacks and the current coalescing group's
-    /// kind (EDIT_*; 0 = none, so the next edit always starts a fresh step).
+    /// Per-note text-edit undo / redo stacks + the current coalescing group's
+    /// kind (EDIT_*; 0 = none, so the next edit starts a fresh step). Ctrl+Z /
+    /// Ctrl+Y walk THESE — purely the text within this one note. Bringing back a
+    /// deleted note is a separate action (Ctrl+Shift+Z, see App.deleted).
     undo: Vec<EditSnap>,
     redo: Vec<EditSnap>,
     edit_kind: u8,
@@ -264,6 +266,19 @@ const EDIT_INSERT: u8 = 1;
 const EDIT_DELETE: u8 = 2;
 const EDIT_DISCRETE: u8 = 3;
 
+/// A deleted note saved so Ctrl+Shift+Z can bring it back faithfully: its
+/// content + geometry + where it lived (free / stacked / docked), plus — when
+/// it was in the stack — its rank in that column, so it slots back into place.
+struct DeletedNote {
+    data: NoteData,
+    /// Rank (0 = topmost) among stacked notes at deletion; None if it was
+    /// free-floating or docked to a corner.
+    stack_rank: Option<usize>,
+}
+
+/// How many deleted notes Ctrl+Shift+Z can walk back through.
+const DELETED_CAP: usize = 30;
+
 struct App {
     cap: Capture,
     renderer: GlassRenderer,
@@ -290,8 +305,18 @@ struct App {
     /// QPC reading at the previous animation step (or the previous idle
     /// iteration, so the first animated frame starts from a fresh baseline).
     anim_prev_qpc: i64,
-    /// Recently deleted notes, newest last (Ctrl+Z restores; capped at 20).
-    trash: Vec<NoteData>,
+    /// Recently deleted notes (newest last) for Ctrl+Shift+Z "bring back the
+    /// last note", capped at DELETED_CAP. Each keeps everything needed to
+    /// restore it exactly (see DeletedNote). Per-note *text* undo is separate
+    /// and lives on each Win (Ctrl+Z / Ctrl+Y).
+    deleted: Vec<DeletedNote>,
+    /// Click-count tracking for word/sentence selection: last text-click time
+    /// (GetMessageTime), its position and note index, and the running 1/2/3 count.
+    last_click_t: u32,
+    last_click_x: i32,
+    last_click_y: i32,
+    last_click_idx: usize,
+    click_count: u32,
     /// The [+] pill menu is showing (Quit + startup pills, catcher armed).
     menu_open: bool,
     /// Fullscreen invisible click-catcher under the pills (dismiss on any
@@ -383,7 +408,12 @@ fn main() -> Result<()> {
         dragging: None,
         selecting: false,
         anim_prev_qpc: 0,
-        trash: Vec::new(),
+        deleted: Vec::new(),
+        last_click_t: 0,
+        last_click_x: 0,
+        last_click_y: 0,
+        last_click_idx: usize::MAX,
+        click_count: 0,
         menu_open: false,
         catcher: None,
         tuck: 0.0,
@@ -400,11 +430,39 @@ fn main() -> Result<()> {
 
     unsafe {
         let instance = GetModuleHandleW(None)?;
+
+        // App icon embedded into the exe via build.rs (resource id 1). This one
+        // handle drives the Alt-Tab / task-view icon (window class) and, at small
+        // size, the system-tray icon. Explorer/Task Manager pick up the same .ico
+        // straight from the exe's resources. Falls back to the stock icon if the
+        // resource is missing (e.g. built without windres).
+        let big_icon: HICON = LoadImageW(
+            Some(instance.into()),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default());
+        let tray_icon: HICON = LoadImageW(
+            Some(instance.into()),
+            PCWSTR(1 as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or(big_icon);
+
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wndproc),
             hInstance: instance.into(),
             lpszClassName: CLASS_NAME,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: big_icon,
             ..Default::default()
         };
         if RegisterClassW(&wc) == 0 {
@@ -415,6 +473,7 @@ fn main() -> Result<()> {
             hInstance: instance.into(),
             lpszClassName: CATCHER_CLASS,
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            hIcon: big_icon,
             ..Default::default()
         };
         if RegisterClassW(&wc_catcher) == 0 {
@@ -444,7 +503,7 @@ fn main() -> Result<()> {
             uID: TRAY_UID,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
+            hIcon: tray_icon,
             szTip: tip,
             ..Default::default()
         };
@@ -1666,14 +1725,17 @@ impl App {
         if idx >= self.windows.len() || !self.windows[idx].is_note() {
             return;
         }
+        if self.windows[idx].closing || self.windows[idx].dying {
+            return;
+        }
+        // Record for undo while the note is still in place, so Ctrl+Z restores
+        // it exactly here (not 34 px up its fade path).
+        self.record_note_delete(idx);
         let mut r = RECT::default();
         unsafe {
             let _ = GetWindowRect(self.windows[idx].hwnd, &mut r);
         }
         let w = &mut self.windows[idx];
-        if w.closing || w.dying {
-            return;
-        }
         w.closing = true;
         w.reveal_to = 0.0;
         w.pos_to = Some((r.left, r.top - 34));
@@ -1694,30 +1756,10 @@ impl App {
         let mut reaped_note = false;
         for &idx in doomed.iter().rev() {
             let hwnd = self.windows[idx].hwnd;
-            // Only real notes are worth a trash entry — a dismissed menu pill
-            // just disappears (never persisted, never undoable).
+            // Only real notes reflow the stack / touch the store. The undo
+            // entry was already recorded when the delete was initiated
+            // (record_note_delete), so reap just tears the window down.
             if self.windows[idx].is_note() {
-                let mut r = RECT::default();
-                unsafe {
-                    let _ = GetWindowRect(hwnd, &mut r);
-                }
-                let html = self.note_html(idx);
-                let win = &self.windows[idx];
-                if self.trash.len() >= 20 {
-                    self.trash.remove(0);
-                }
-                self.trash.push(NoteData {
-                    id: win.id,
-                    text: html,
-                    x: r.left,
-                    y: r.top,
-                    w: r.right - r.left,
-                    h: r.bottom - r.top,
-                    free: win.free,
-                    docked: win.docked,
-                    color: win.color,
-                    font_size: win.font_size,
-                });
                 reaped_note = true;
             }
             if let Some(sh) = self.windows[idx].shadow {
@@ -1754,32 +1796,219 @@ impl App {
         }
     }
 
-    /// Ctrl+Z: resurrect the most recently deleted note from the trash.
-    fn undo_delete(&mut self) {
-        let Some(n) = self.trash.pop() else { return };
-        if self.create_window(n.x, n.y, n.w, n.h, false, n.id).is_ok() {
-            let i = self.windows.len() - 1;
-            let (chars, attrs) = parse_html(&n.text);
+    /// Snapshot note `idx`'s persistent data (position taken from `r`) for the
+    /// undo history's delete entry.
+    fn capture_note_data(&self, idx: usize, r: RECT) -> NoteData {
+        let win = &self.windows[idx];
+        NoteData {
+            id: win.id,
+            text: self.note_html(idx),
+            x: r.left,
+            y: r.top,
+            w: r.right - r.left,
+            h: r.bottom - r.top,
+            free: win.free,
+            docked: win.docked,
+            color: win.color,
+            font_size: win.font_size,
+        }
+    }
+
+    /// Rank (0 = topmost) of note `idx` within the stacked column, or None if
+    /// it isn't a plain stacked note (free-floating or docked to a corner).
+    fn stack_rank_of(&self, idx: usize) -> Option<usize> {
+        if !self.windows[idx].is_note()
+            || self.windows[idx].free
+            || self.windows[idx].docked != 0
+        {
+            return None;
+        }
+        self.stacked_indices().iter().position(|&j| j == idx)
+    }
+
+    /// Record a note deletion for Ctrl+Shift+Z the moment the delete is
+    /// *initiated* (swipe/close): capture the note where it still sits, its
+    /// stack rank, and its free/docked state, so the later restore is faithful.
+    /// reap_dying then only tears the window down.
+    fn record_note_delete(&mut self, idx: usize) {
+        if idx >= self.windows.len() || !self.windows[idx].is_note() {
+            return;
+        }
+        let stack_rank = self.stack_rank_of(idx);
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.windows[idx].hwnd, &mut r);
+        }
+        let data = self.capture_note_data(idx, r);
+        if self.deleted.len() >= DELETED_CAP {
+            self.deleted.remove(0);
+        }
+        self.deleted.push(DeletedNote { data, stack_rank });
+        // Ctrl+Shift+Z only reaches us while one of our windows holds keyboard
+        // focus. Deleting the focused note would drop focus to another app, so
+        // hand it to the always-present + button. (WM_KILLFOCUS clears focused.)
+        if self.focused == Some(idx) {
+            if let Some(b) = self.windows.iter().find(|w| w.is_button).map(|w| w.hwnd) {
+                unsafe {
+                    let _ = SetFocus(Some(b));
+                }
+            }
+        }
+    }
+
+    /// Ctrl+Shift+Z: bring back the most recently deleted note, restored to
+    /// exactly how it lived — free at its old spot, docked to the same corner,
+    /// or slotted back into the stack at its old rank. Returns its new index.
+    fn restore_last_deleted(&mut self) -> Option<usize> {
+        let dn = self.deleted.pop()?;
+        let n = dn.data;
+        // Create it (position is provisional; refined per-kind below).
+        if self.create_window(n.x, n.y, n.w, n.h, false, n.id).is_err() {
+            return None;
+        }
+        let i = self.windows.len() - 1;
+        let (chars, attrs) = parse_html(&n.text);
+        {
             let w = &mut self.windows[i];
             w.text = chars;
             w.attrs = attrs;
             w.caret = 0;
-            w.free = n.free;
-            w.docked = n.docked;
             w.color = n.color;
             w.font_size = n.font_size;
             w.reveal = 0.0; // fade back in
             w.reveal_to = 1.0;
-            self.update_text(i); // render at reveal=0 before showing (no flash)
-            unsafe {
-                let _ = ShowWindow(self.windows[i].hwnd, SW_SHOWNOACTIVATE);
-            }
-            self.start_anim_timer();
-            if !n.free {
-                self.relayout_stack(true);
-            }
-            self.mark_dirty();
+            w.free = n.free;
+            w.docked = 0;
         }
+        self.update_text(i); // render at reveal=0 before showing (no flash)
+        unsafe {
+            let _ = ShowWindow(self.windows[i].hwnd, SW_SHOWNOACTIVATE);
+        }
+        if n.docked != 0 {
+            // Docked to a corner: re-dock to the same side. dock_note recomputes
+            // the sliver x and stacks it below the other notes docked there.
+            self.dock_note(i, n.docked);
+        } else if !n.free {
+            // In the stack: slot it back at its old rank, then repack the column.
+            self.windows[i].free = false;
+            self.windows[i].docked = 0;
+            self.place_at_stack_rank(i, dn.stack_rank.unwrap_or(usize::MAX));
+            self.relayout_stack(true);
+        } else {
+            // Free-floating: put it back at its old spot, clamped fully on-screen
+            // (so a note swiped off the edge returns somewhere visible).
+            let wa = work_area();
+            let x = n.x.clamp(wa.left + 8, (wa.right - n.w - 8).max(wa.left + 8));
+            let y = n.y.clamp(wa.top + 8, (wa.bottom - n.h - 8).max(wa.top + 8));
+            self.windows[i].free = true;
+            self.windows[i].docked = 0;
+            unsafe {
+                let _ = SetWindowPos(
+                    self.windows[i].hwnd,
+                    None,
+                    x,
+                    y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        self.start_anim_timer();
+        self.mark_dirty();
+        Some(i)
+    }
+
+    /// Slot stacked note `i` into `rank` (0 = top) among the OTHER stacked
+    /// notes by setting its top just below the note above it — relayout_stack
+    /// then repacks the column cleanly in top-to-bottom order.
+    fn place_at_stack_rank(&mut self, i: usize, rank: usize) {
+        let top_of = |s: &Self, j: usize| -> i32 {
+            let mut r = RECT::default();
+            unsafe {
+                let _ = GetWindowRect(s.windows[j].hwnd, &mut r);
+            }
+            r.top
+        };
+        let mut others: Vec<usize> = (0..self.windows.len())
+            .filter(|&j| {
+                j != i
+                    && self.windows[j].is_note()
+                    && !self.windows[j].free
+                    && self.windows[j].docked == 0
+            })
+            .collect();
+        if others.is_empty() {
+            return; // only note in the stack; relayout_stack places it
+        }
+        others.sort_by_key(|&j| top_of(self, j));
+        let rank = rank.min(others.len());
+        let y = if rank == 0 {
+            top_of(self, others[0]) - 1
+        } else {
+            top_of(self, others[rank - 1]) + 1
+        };
+        let mut r = RECT::default();
+        unsafe {
+            let _ = GetWindowRect(self.windows[i].hwnd, &mut r);
+            let _ = SetWindowPos(
+                self.windows[i].hwnd,
+                None,
+                r.left,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Ctrl+Z: undo the last text edit within note `i`; false if nothing to undo.
+    fn text_undo(&mut self, i: usize) -> bool {
+        let Some(prev) = self.windows[i].undo.pop() else {
+            return false;
+        };
+        let cur = self.edit_snap(i);
+        let w = &mut self.windows[i];
+        w.redo.push(cur);
+        w.text = prev.text;
+        w.attrs = prev.attrs;
+        w.caret = prev.caret.min(w.text.len());
+        w.sel = None;
+        w.edit_kind = 0; // break coalescing across an undo
+        true
+    }
+
+    /// Ctrl+Y: redo the last undone text edit within note `i`; false if none.
+    fn text_redo(&mut self, i: usize) -> bool {
+        let Some(next) = self.windows[i].redo.pop() else {
+            return false;
+        };
+        let cur = self.edit_snap(i);
+        let w = &mut self.windows[i];
+        w.undo.push(cur);
+        w.text = next.text;
+        w.attrs = next.attrs;
+        w.caret = next.caret.min(w.text.len());
+        w.sel = None;
+        w.edit_kind = 0;
+        true
+    }
+
+    /// Post-undo/redo housekeeping: focus note `i`, redraw it, re-arm auto-height.
+    fn focus_after_history(&mut self, i: usize) {
+        if i >= self.windows.len() {
+            return;
+        }
+        self.caret_on = true;
+        self.focused = Some(i);
+        let ih = self.windows[i].hwnd;
+        unsafe {
+            let _ = SetFocus(Some(ih));
+            let _ = SetTimer(Some(ih), TIMER_AUTOH, 40, None);
+        }
+        self.update_text(i);
+        self.mark_dirty();
     }
 
     /// Serialize note `i`'s text+attrs to the persisted HTML form: <b>/<i>/<s>
@@ -1970,9 +2199,9 @@ impl App {
         }
     }
 
-    /// Record the pre-edit state before a mutation, coalescing consecutive
-    /// same-kind INSERT/DELETE runs into one undo step. Call this *before*
-    /// changing text/attrs. Clears the redo stack (a new edit forks history).
+    /// Record the pre-edit state before a mutation onto note `i`'s own undo
+    /// stack, coalescing consecutive same-kind INSERT/DELETE runs into one step.
+    /// Call this *before* changing text/attrs. Clears the note's redo stack.
     fn record_edit(&mut self, i: usize, kind: u8) {
         let coalesce = kind != EDIT_DISCRETE && self.windows[i].edit_kind == kind;
         if !coalesce {
@@ -1985,38 +2214,6 @@ impl App {
             w.redo.clear();
         }
         self.windows[i].edit_kind = kind;
-    }
-
-    /// Undo the last text edit on note `i`; false if there's nothing to undo.
-    fn text_undo(&mut self, i: usize) -> bool {
-        let Some(prev) = self.windows[i].undo.pop() else {
-            return false;
-        };
-        let cur = self.edit_snap(i);
-        let w = &mut self.windows[i];
-        w.redo.push(cur);
-        w.text = prev.text;
-        w.attrs = prev.attrs;
-        w.caret = prev.caret.min(w.text.len());
-        w.sel = None;
-        w.edit_kind = 0; // break coalescing across an undo
-        true
-    }
-
-    /// Redo the last undone text edit on note `i`; false if nothing to redo.
-    fn text_redo(&mut self, i: usize) -> bool {
-        let Some(next) = self.windows[i].redo.pop() else {
-            return false;
-        };
-        let cur = self.edit_snap(i);
-        let w = &mut self.windows[i];
-        w.undo.push(cur);
-        w.text = next.text;
-        w.attrs = next.attrs;
-        w.caret = next.caret.min(w.text.len());
-        w.sel = None;
-        w.edit_kind = 0;
-        true
     }
 
     /// Capture the persistent state of every note (never the button, and
@@ -2747,6 +2944,89 @@ fn next_word_boundary(text: &[char], caret: usize) -> usize {
     i
 }
 
+/// [start, end) of the word at `pos` for a double-click select. Clicking on a
+/// word char (or just after one) selects that whitespace-delimited word;
+/// clicking in a gap selects the run of whitespace. Empty text → (0, 0).
+fn word_at(text: &[char], pos: usize) -> (usize, usize) {
+    let n = text.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    // Pick the anchor char: the one under the caret if it's a word char, else
+    // the one to its left (so clicking at a word's trailing edge grabs it).
+    let idx = if pos < n && !text[pos].is_whitespace() {
+        Some(pos)
+    } else if pos > 0 && !text[pos - 1].is_whitespace() {
+        Some(pos - 1)
+    } else {
+        None
+    };
+    match idx {
+        Some(a) => {
+            let mut s = a;
+            let mut e = a + 1;
+            while s > 0 && !text[s - 1].is_whitespace() {
+                s -= 1;
+            }
+            while e < n && !text[e].is_whitespace() {
+                e += 1;
+            }
+            (s, e)
+        }
+        None => {
+            // In a whitespace gap: select the whitespace run around `pos`.
+            let mut s = pos.min(n);
+            let mut e = pos.min(n);
+            while s > 0 && text[s - 1].is_whitespace() {
+                s -= 1;
+            }
+            while e < n && text[e].is_whitespace() {
+                e += 1;
+            }
+            (s, e)
+        }
+    }
+}
+
+/// [start, end) of the sentence at `pos` for a triple-click select. Sentences
+/// break on `.`/`!`/`?` (the terminator is kept with its sentence) and on hard
+/// newlines. Leading whitespace after the previous sentence is trimmed.
+fn sentence_at(text: &[char], pos: usize) -> (usize, usize) {
+    let n = text.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    let is_end = |c: char| c == '.' || c == '!' || c == '?';
+    let p = pos.min(n);
+    // Scan left to just past the previous terminator or newline.
+    let mut s = p;
+    while s > 0 {
+        let c = text[s - 1];
+        if c == '\n' || is_end(c) {
+            break;
+        }
+        s -= 1;
+    }
+    // Trim leading spaces/tabs (but not the newline itself) so the highlight
+    // starts at the first visible character.
+    while s < n && (text[s] == ' ' || text[s] == '\t') {
+        s += 1;
+    }
+    // Scan right through the next terminator (kept) or up to a newline/end.
+    let mut e = p.max(s);
+    while e < n {
+        let c = text[e];
+        if c == '\n' {
+            break;
+        }
+        e += 1;
+        if is_end(c) {
+            break;
+        }
+    }
+    (s.min(e), e)
+}
+
 /// Char index → UTF-16 offset over a char buffer (DirectWrite works in UTF-16).
 fn chars_to_u16(text: &[char], c: usize) -> u32 {
     text[..c.min(text.len())]
@@ -3059,17 +3339,65 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             let _ = SetForegroundWindow(hwnd);
                             let _ = SetFocus(Some(hwnd));
                         }
-                        // Caret to the clicked spot; anchor a mouse selection
-                        // there (a plain click collapses it on button-up).
+                        app.windows[i].edit_kind = 0; // click breaks the coalesce run
                         let pos =
                             app.hit_test_char(i, (p.x - r.left) as f32, (p.y - r.top) as f32);
-                        let w = &mut app.windows[i];
-                        w.caret = pos;
-                        w.sel = Some(pos);
-                        w.edit_kind = 0; // clicking breaks the typing-coalesce run
-                        app.selecting = true;
-                        unsafe {
-                            let _ = SetCapture(hwnd);
+                        // Click-count: repeated clicks on the same spot + note
+                        // within the system double-click window step
+                        // caret -> word -> sentence, then wrap back to caret.
+                        let now = unsafe { GetMessageTime() } as u32;
+                        let dbl = unsafe { GetDoubleClickTime() };
+                        let (mcx, mcy) = unsafe {
+                            (
+                                GetSystemMetrics(SM_CXDOUBLECLK) / 2,
+                                GetSystemMetrics(SM_CYDOUBLECLK) / 2,
+                            )
+                        };
+                        let near = (p.x - app.last_click_x).abs() <= mcx
+                            && (p.y - app.last_click_y).abs() <= mcy;
+                        if now.wrapping_sub(app.last_click_t) <= dbl
+                            && near
+                            && app.last_click_idx == i
+                            && app.click_count < 3
+                        {
+                            app.click_count += 1;
+                        } else {
+                            app.click_count = 1;
+                        }
+                        app.last_click_t = now;
+                        app.last_click_x = p.x;
+                        app.last_click_y = p.y;
+                        app.last_click_idx = i;
+
+                        match app.click_count {
+                            2 => {
+                                // Double-click: select the word under the cursor.
+                                let (s, e) = word_at(&app.windows[i].text, pos);
+                                let w = &mut app.windows[i];
+                                w.sel = Some(s);
+                                w.caret = e;
+                                app.selecting = false;
+                            }
+                            3 => {
+                                // Triple-click: select the whole sentence.
+                                let (s, e) = sentence_at(&app.windows[i].text, pos);
+                                let w = &mut app.windows[i];
+                                w.sel = Some(s);
+                                w.caret = e;
+                                app.selecting = false;
+                            }
+                            _ => {
+                                // Single click: caret to the clicked spot; anchor
+                                // a mouse selection there (a plain click collapses
+                                // it on button-up).
+                                let w = &mut app.windows[i];
+                                w.caret = pos;
+                                w.sel = Some(pos);
+                                app.selecting = true;
+                                unsafe {
+                                    let _ = SetCapture(hwnd);
+                                }
+                            }
                         }
                         app.caret_on = true;
                         app.update_text(i);
@@ -3245,6 +3573,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // flies; anim_tick advances it and reap_dying trashes it.
                     let speed = (d.vx * d.vx + d.vy * d.vy).sqrt();
                     if speed > 2000.0 {
+                        // Record the delete for undo now, while the note is
+                        // still at its on-screen spot (before it flies off), so
+                        // Ctrl+Z brings it back where it was.
+                        app.record_note_delete(d.idx);
                         // Throw-spin: torque = grab-offset (from note center)
                         // × velocity, so a note grabbed off-center tumbles in
                         // the direction it was flung. Capped so it stays sane.
@@ -3486,13 +3818,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                     app.record_edit(i, EDIT_INSERT);
                                 }
                                 app.delete_selection(i);
-                                let w = &mut app.windows[i];
-                                let a = typing_attr(w);
-                                w.text.insert(w.caret, ch);
-                                w.attrs.insert(w.caret, a);
-                                w.caret += 1;
+                                {
+                                    let w = &mut app.windows[i];
+                                    let a = typing_attr(w);
+                                    w.text.insert(w.caret, ch);
+                                    w.attrs.insert(w.caret, a);
+                                    w.caret += 1;
+                                }
                                 if ch.is_whitespace() {
-                                    w.edit_kind = 0; // next char starts a new step
+                                    app.windows[i].edit_kind = 0; // new step next char
                                 }
                             }
                         }
@@ -3512,30 +3846,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         WM_KEYDOWN => {
             let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-            // Ctrl+Z / Ctrl+Shift+Z: undo / redo the last text edit on the
-            // focused note. Ctrl+Z with no edit history left falls back to
-            // restoring the most recently deleted note (app-global trash).
+            // Ctrl+Z: plain within-note text undo on the focused note.
+            // Ctrl+Shift+Z: bring back the most recently deleted note (restored
+            // to its old spot / stack rank / docked corner) — a separate action.
             if ctrl && wparam.0 as u16 == 0x5A {
                 let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-                let fi = app
-                    .focused
-                    .filter(|&i| i < app.windows.len() && app.windows[i].is_note());
-                let done = match (fi, shift) {
-                    (Some(i), false) => app.text_undo(i).then_some(i),
-                    (Some(i), true) => app.text_redo(i).then_some(i),
-                    _ => None,
-                };
-                if let Some(i) = done {
-                    app.caret_on = true;
-                    app.update_text(i);
-                    app.mark_dirty();
-                    unsafe {
-                        let _ = SetTimer(Some(hwnd), TIMER_AUTOH, 40, None);
+                if shift {
+                    if let Some(i) = app.restore_last_deleted() {
+                        app.focus_after_history(i);
                     }
-                    return LRESULT(0);
-                }
-                if !shift {
-                    app.undo_delete();
+                } else if let Some(i) = app
+                    .focused
+                    .filter(|&i| i < app.windows.len() && app.windows[i].is_note())
+                {
+                    if app.text_undo(i) {
+                        app.caret_on = true;
+                        app.update_text(i);
+                        app.mark_dirty();
+                        unsafe {
+                            let _ = SetTimer(Some(hwnd), TIMER_AUTOH, 40, None);
+                        }
+                    }
                 }
                 return LRESULT(0);
             }

@@ -33,10 +33,12 @@ Notes:
 
 - **Drag** the top strip to move a note; pull any **edge/corner** to resize.
 - **Flick** a note fast and let go to **throw it away** (delete) — it spins off
-  and can be restored with Ctrl+Z.
+  and can be brought back with **Ctrl+Shift+Z**.
 - Drop a note against the **left/right screen edge** to **dock** it as a thin
   sliver; hover to peek, click to bring it back.
 - Click a note's body to edit; only the focused note shows a caret.
+- **Double-click** selects the word under the cursor; **triple-click** selects
+  the whole sentence.
 
 ### Keyboard shortcuts (while editing a note)
 
@@ -49,7 +51,7 @@ Notes:
 | Shift + any of the above | Extend the selection |
 | Ctrl+A | Select all |
 | Ctrl+C / Ctrl+X / Ctrl+V | Copy / cut / paste |
-| Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z) | Undo / redo the text edit |
+| Ctrl+Z / Ctrl+Y | Undo / redo the text edit (within the focused note) |
 | Backspace / Delete | Delete a character |
 | Ctrl+Backspace / Ctrl+Delete | Delete a word |
 | Ctrl+B / Ctrl+I | Bold / italic the selection |
@@ -57,7 +59,10 @@ Notes:
 | Ctrl+= / Ctrl+- | Grow / shrink the note's font |
 | Ctrl+W | Close the note |
 
-With no note focused, **Ctrl+Z** restores the most recently deleted note.
+**Ctrl+Shift+Z** brings back the most recently deleted note — restored to how
+it lived: at its old spot if it was free-floating, re-docked to the same corner,
+or slotted back into the stack at its original position. Repeat to walk back
+through recent deletions.
 
 ### Backdrop modes
 

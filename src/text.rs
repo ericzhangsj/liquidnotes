@@ -21,6 +21,18 @@ fn pad() -> f32 {
     crate::scale::scf(PAD)
 }
 
+/// Text supersampling factor. The whole text layer (glyphs, caret, and the
+/// settings pill sliders) is rendered at TEXT_SS× the note's pixel resolution —
+/// the D2D DC DPI (96·TEXT_SS), make_target's DPI and make_text's texture size
+/// all key off this — and the glass shader averages an SS×SS box of texels back
+/// down to each output pixel (`txcfg` in glass.hlsl). An earlier attempt at >1
+/// looked soft because the shader took a single bilinear tap, which
+/// *undersamples* a larger texture; the explicit box-average fixes that, so
+/// raising this genuinely increases glyph-edge resolution instead of blurring.
+/// 3 = crisp at a modest cost (the text texture is 9× the pixels — negligible
+/// for sticky notes).
+pub const TEXT_SS: u32 = 3;
+
 /// Per-character style bits, stored as one `u8` mask per char in a buffer
 /// kept strictly parallel to the note's text.
 pub const A_BOLD: u8 = 1;
@@ -65,8 +77,35 @@ impl TextRenderer {
             let dxgi: IDXGIDevice = device.cast()?;
             let d2d_device = factory.CreateDevice(&dxgi)?;
             let dc = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            // The glyphs are laid down as pure ALPHA coverage (the shader inks
+            // them), so ClearType can't apply and would only bake colour fringes
+            // into the texture — force clean grayscale coverage.
+            dc.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            // Drive the context at 96·TEXT_SS DPI (TEXT_SS = 1 → native 96, so
+            // note-space coords map 1:1 to device pixels and the hinter can
+            // grid-fit glyph stems onto real pixels).
+            dc.SetDpi(96.0 * TEXT_SS as f32, 96.0 * TEXT_SS as f32);
 
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            // Force grid-fitted (hinted) grayscale rasterisation: keep the
+            // system gamma / contrast but pin the rendering mode to
+            // NATURAL_SYMMETRIC so glyph stems snap to the pixel grid and read
+            // crisp, instead of the size-based default occasionally choosing an
+            // unhinted, soft mode. (ClearType stays off — set above — because the
+            // glyphs are alpha coverage the shader tints, so there is no fixed
+            // backdrop for subpixel AA; that is why this can't match a webpage's
+            // ClearType sharpness exactly.)
+            if let Ok(sys) = dwrite.CreateRenderingParams() {
+                if let Ok(params) = dwrite.CreateCustomRenderingParams(
+                    sys.GetGamma(),
+                    sys.GetEnhancedContrast(),
+                    sys.GetClearTypeLevel(),
+                    sys.GetPixelGeometry(),
+                    DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
+                ) {
+                    dc.SetTextRenderingParams(&params);
+                }
+            }
             // Bundled Inter (a modern sans) in a private collection, so it
             // renders on every machine without being installed.
             let (fonts, _font_loader) = Self::load_bundled_font(&dwrite)?;
@@ -170,8 +209,10 @@ impl TextRenderer {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
-                dpiX: 96.0,
-                dpiY: 96.0,
+                // Texture is TEXT_SS× the window; a matching DPI keeps the
+                // metadata consistent (the DC's DPI does the actual scaling).
+                dpiX: 96.0 * TEXT_SS as f32,
+                dpiY: 96.0 * TEXT_SS as f32,
                 bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
                 colorContext: std::mem::ManuallyDrop::new(None),
             };

@@ -30,6 +30,7 @@ struct Params {
     blur: [f32; 4],   // sigma, radius_texels, dirX, dirY (psblur only)
     light: [f32; 4],  // intensity, angle_rad, elevation_rad, spare (psglass only)
     fx: [f32; 4],     // reveal, glow, active (fill opacity bump), spare
+    txt: [f32; 4],    // text layer: SS factor, 1/texW, 1/texH, spare (psglass only)
 }
 
 pub struct GlassRenderer {
@@ -157,9 +158,13 @@ impl GlassRenderer {
         h: u32,
     ) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView, ID2D1Bitmap1)> {
         unsafe {
+            // The text texture is TEXT_SS× the window (TEXT_SS = 1 → native
+            // resolution, so the hinter grid-fits to real pixels). If ever
+            // raised >1, the glass shader's linear sampler box-downsamples it.
+            let ss = crate::text::TEXT_SS;
             let desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
+                Width: w * ss,
+                Height: h * ss,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -543,6 +548,13 @@ impl GlassRenderer {
                 active.clamp(0.0, 1.0),
                 cmix.clamp(0.0, 1.0),
             ],
+            // Text layer is rendered at TEXT_SS× (texture is w·ss × h·ss); hand
+            // the shader the SS factor and the text-texel size so it can average
+            // an ss×ss box back down to each output pixel.
+            txt: {
+                let ss = crate::text::TEXT_SS as f32;
+                [ss, 1.0 / (w as f32 * ss), 1.0 / (h as f32 * ss), 0.0]
+            },
             ..Default::default()
         };
 

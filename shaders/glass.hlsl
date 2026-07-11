@@ -24,6 +24,7 @@ cbuffer Params : register(b0) {
     float4 blur;   // sigma | radius texels | dir x, y   (psblur only)
     float4 light;  // fresnel rim intensity | screen-light azimuth rad (per-note) | (unused) | opacity
     float4 fx;     // reveal | snap glow | active (fill opacity bump) | spare (psglass only)
+    float4 txcfg;  // text supersample factor | 1/textW | 1/textH | spare (psglass only)
 };
 
 struct VSO {
@@ -219,11 +220,29 @@ float4 psglass(VSO i) : SV_Target {
     // Text ink CONTRASTS the box (which itself matches the backdrop): white
     // font on a dark box, near-black font on a light box. Same `mix` band as
     // the fill so the ink cross-fades in lockstep with the box colour.
-    float4 txt = textTex.Sample(samp, i.uv);
+    //
+    // Supersampled text: the text layer is rendered at TEXT_SS× the note
+    // resolution, so downsample by averaging an ss×ss box of texels. Each tap
+    // lands exactly on a source-texel centre (uv ± whole texels), so the linear
+    // sampler returns that texel unblended — a true box average, not a smeared
+    // single tap. This is what makes the glyph edges read high-res/crisp.
+    int ss = max(1, (int)txcfg.x);
+    float2 tpx = txcfg.yz;               // one text texel in uv
+    float2 c0 = -0.5 * (float(ss) - 1.0) * tpx; // top-left tap offset of the box
+    float4 txt = 0.0;
+    [loop] for (int ty = 0; ty < ss; ++ty) {
+        [loop] for (int tx = 0; tx < ss; ++tx) {
+            txt += textTex.Sample(samp, i.uv + c0 + float2(tx, ty) * tpx);
+        }
+    }
+    txt /= float(ss * ss);
     if (txt.a > 0.001) {
         float3 ink = lerp(float3(0.97, 0.97, 0.98),   // white on dark box
                           float3(0.08, 0.08, 0.10),   // near-black on light box
                           mix);
+        // Grid-fitted grayscale coverage: composite it straight. (An earlier
+        // pow() "fatten" widened the AA fringe to fake weight and read as blur
+        // — removed; hinting at native res keeps the true stem weight.)
         col = lerp(col, ink, txt.a);
     }
 
