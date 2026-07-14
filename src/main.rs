@@ -363,6 +363,14 @@ const FLING_MAX_SPIN: f32 = 1440.0;
 /// Thrown notes fade for twice as long as ordinary reveal/close transitions.
 const FLING_FADE_TIME_SCALE: f32 = 2.0;
 
+/// Captured desktop frames inherit the display cadence from DXGI duplication
+/// and must reach DirectComposition without another blocking frame wait. Local
+/// animation ticks are timer-driven, so they still need DWM back-pressure when
+/// no capture frame is available to pace the batch naturally.
+fn should_flush_compositor(captured_desktop_frame: bool, app_animating: bool) -> bool {
+    app_animating && !captured_desktop_frame
+}
+
 /// Turn one sufficiently long physical-pixel sample into a DPI-independent
 /// smoothed velocity. Returning `None` leaves the anchor untouched so several
 /// high-polling sub-samples accumulate into one trustworthy time window.
@@ -839,13 +847,14 @@ fn main() -> Result<()> {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
-            app.pump(false);
+            let captured_desktop_frame = app.pump(false);
             // Animations use a QPC delta-time step, so their duration stays
             // stable at 60/120/180 Hz. DWM pacing below decides presentation
             // cadence instead of a fixed timer guessing the monitor refresh.
             let mut now = 0i64;
             let _ = QueryPerformanceCounter(&mut now);
-            if app.any_animating() {
+            let app_animating = app.any_animating();
+            if app_animating {
                 // Clamp dt so a long stall doesn't teleport the eases.
                 let dt = (((now - app.anim_prev_qpc) as f64 / qpc_freq) as f32).clamp(0.0, 0.05);
                 app.anim_prev_qpc = now;
@@ -856,12 +865,15 @@ fn main() -> Result<()> {
                 app.anim_prev_qpc = now;
             }
             app.reap_dying();
-            // All composition swapchains use Present(0) so multiple notes can
-            // submit without blocking one-by-one. Flush once after the batch:
-            // this applies compositor back-pressure at the monitor cadence,
-            // eliminating the uneven queued frames visible on 60 Hz/iGPU/high-
-            // DPI laptops while retaining the native high refresh on desktops.
-            let _ = DwmFlush();
+            // Desktop-duplication frames are already paced by the monitor. A
+            // DwmFlush after one of those frames makes the newly captured
+            // backdrop miss the next composition opportunity and visibly trail
+            // fast scrolling. Only apply compositor back-pressure to app-only
+            // animation ticks, which can otherwise submit at the 3 ms polling
+            // cadence and look uneven on slower laptop GPUs.
+            if should_flush_compositor(captured_desktop_frame, app_animating) {
+                let _ = DwmFlush();
+            }
         }
         app.save_all();
         // Quit with the menu open (tray Quit, etc.): free the catcher too.
@@ -1155,6 +1167,18 @@ mod fling_tests {
         assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 96), 50);
         assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 144), 75);
         assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 192), 100);
+    }
+
+    #[test]
+    fn captured_desktop_frames_are_never_delayed_by_a_dwm_flush() {
+        assert!(!should_flush_compositor(true, false));
+        assert!(!should_flush_compositor(true, true));
+    }
+
+    #[test]
+    fn app_only_animation_keeps_compositor_back_pressure() {
+        assert!(should_flush_compositor(false, true));
+        assert!(!should_flush_compositor(false, false));
     }
 
     fn test_rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
@@ -3362,7 +3386,7 @@ impl App {
 
     /// One engine heartbeat: pump duplication frames into the background
     /// (excluding our windows), and re-render everything if it changed.
-    fn pump(&mut self, force_render: bool) {
+    fn pump(&mut self, force_render: bool) -> bool {
         // Live mode: our windows never appear in capture frames, so nothing
         // needs masking and the pixels under notes stay current.
         let rects = if self.live { Vec::new() } else { self.window_rects() };
@@ -3391,6 +3415,7 @@ impl App {
                 self.render_one(i);
             }
         }
+        updated
     }
 
     fn on_moved_or_resized(&mut self, hwnd: HWND) {
