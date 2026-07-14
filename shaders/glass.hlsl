@@ -22,7 +22,7 @@ cbuffer Params : register(b0) {
     float4 frost;  // sigma | margin offset px | 1/blurTexW, 1/blurTexH
     float4 cursor; // minU, minV, maxU, maxV  (>=2 means "no pointer")
     float4 blur;   // sigma | radius texels | dir x, y   (psblur only)
-    float4 light;  // fresnel rim intensity | screen-light azimuth rad (per-note) | (unused) | opacity
+    float4 light;  // fresnel rim intensity | screen-light azimuth | danger tint | opacity
     float4 fx;     // reveal | snap glow | active (fill opacity bump) | spare (psglass only)
     float4 txcfg;  // text supersample factor | 1/textW | 1/textH | spare (psglass only)
 };
@@ -187,6 +187,13 @@ float4 psglass(VSO i) : SV_Target {
     float3 fillCol = lerp(float3(0.10, 0.10, 0.12),   // dark box
                           float3(0.95, 0.95, 0.97),   // light box
                           mix);
+    // The Quit pill keeps the same adaptive glass, with a restrained red wash
+    // in both dark and light schemes so it reads as destructive, not alarming.
+    float danger = saturate(light.z);
+    float3 dangerCol = lerp(float3(0.26, 0.055, 0.070),
+                            float3(1.00, 0.76, 0.79),
+                            mix);
+    fillCol = lerp(fillCol, dangerCol, danger);
     float active = fx.z;
     float op = saturate(light.w + 0.30 * active);
     if (op > 0.0001) {

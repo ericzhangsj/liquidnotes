@@ -16,16 +16,18 @@ To start it with Windows: right-click the **+** → toggle **Launch on startup**
 
 - **New note** — left-click the **+** (or press **Win+Shift+N**, or left-click
   the tray icon). New notes stack above the button.
-- **Move / resize** — drag a note's top strip to move it; pull any edge or
-  corner to resize.
+- **Move / resize** — hover a note to reveal its top handlebar, drag that handle
+  to move it, or pull any edge or corner to resize.
 - **Delete** — flick a note fast and let go: it spins off the screen. Bring the
   last one back with **Ctrl+Shift+Z**, restored to right where it was.
-- **Dock** — drop a note against the left or right screen edge to tuck it away
-  as a thin sliver; click it to slide it back.
+- **Dock** — bring the cursor near the left or right screen edge while dragging
+  to tuck a note away as a thin sliver. The optional **Slide out hidden notes**
+  setting reveals it on direct hover; revealed notes can still be edited and
+  resized without losing their border position.
 - **Edit** — click a note's body to type. **Double-click** selects a word,
   **triple-click** a sentence.
 - **Settings** — right-click the **+** for a pill menu: **Quit**, **Launch on
-  startup**, and **Opacity** / **Size** sliders.
+  startup**, **Slide out hidden notes**, and **Opacity** / **Size** sliders.
 
 ### Keyboard shortcuts
 

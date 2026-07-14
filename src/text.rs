@@ -15,10 +15,18 @@ use windows_numerics::Vector2;
 /// Padding (px) from the note edge to the text block, at 100% scale.
 pub const PAD: f32 = 22.0;
 
+/// Dedicated draggable chrome above the old note body. Keeping this separate
+/// from `PAD` lets the window grow upward without moving the existing text.
+pub const NOTE_HEADER: f32 = 20.0;
+
 /// The text inset scaled for the current UI scale, so text keeps the same
 /// proportional margin on a high-DPI (larger-pixel) note.
 fn pad() -> f32 {
     crate::scale::scf(PAD)
+}
+
+fn header() -> f32 {
+    crate::scale::scf(NOTE_HEADER)
 }
 
 /// Text supersampling factor. The whole text layer (glyphs, caret, and the
@@ -67,6 +75,7 @@ pub struct TextRenderer {
     caret_brush: ID2D1SolidColorBrush,
     placeholder_brush: ID2D1SolidColorBrush,
     sel_brush: ID2D1SolidColorBrush,
+    handle_brush: ID2D1SolidColorBrush,
 }
 
 impl TextRenderer {
@@ -160,6 +169,15 @@ impl TextRenderer {
                 },
                 None,
             )?;
+            let handle_brush = dc.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 1.0,
+                    g: 1.0,
+                    b: 1.0,
+                    a: 0.40,
+                },
+                None,
+            )?;
 
             Ok(Self {
                 dc,
@@ -171,6 +189,7 @@ impl TextRenderer {
                 caret_brush,
                 placeholder_brush,
                 sel_brush,
+                handle_brush,
             })
         }
     }
@@ -237,8 +256,10 @@ impl TextRenderer {
         show_caret: bool,
         font_size: f32,
         sel: Option<(u32, u32)>,
+        header_frac: f32,
     ) -> Result<()> {
         unsafe {
+            let header_y = header() * header_frac.clamp(0.0, 1.0);
             let empty = text.is_empty();
             let shown = if empty { PLACEHOLDER } else { text };
             let utf16: Vec<u16> = shown.encode_utf16().collect();
@@ -246,7 +267,7 @@ impl TextRenderer {
                 &utf16,
                 &self.format,
                 (w as f32 - 2.0 * pad()).max(1.0),
-                (h as f32 - 2.0 * pad()).max(1.0),
+                (h as f32 - header_y - 2.0 * pad()).max(1.0),
             )?;
             // Per-note size overrides the base format on this layout only.
             let _ = layout.SetFontSize(
@@ -268,19 +289,50 @@ impl TextRenderer {
                 b: 0.0,
                 a: 0.0,
             }));
+            // Visible drag affordance in the new top chrome. It is alpha
+            // coverage like the text, so the glass shader inks it adaptively.
+            let hs = crate::scale::ui_scale();
+            let handle_w = 42.0 * hs;
+            let handle_h = 5.0 * hs;
+            let handle = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: (w as f32 - handle_w) * 0.5,
+                    top: (header_y - handle_h) * 0.5,
+                    right: (w as f32 + handle_w) * 0.5,
+                    bottom: (header_y + handle_h) * 0.5,
+                },
+                radiusX: handle_h * 0.5,
+                radiusY: handle_h * 0.5,
+            };
+            self.handle_brush.SetOpacity(header_frac.clamp(0.0, 1.0));
+            self.dc.FillRoundedRectangle(&handle, &self.handle_brush);
             // Selection highlight first, so the text sits on top of it.
             if let Some((s0, s1)) = sel {
                 if !empty && s1 > s0 {
                     // First call sizes the metrics buffer (fails with
                     // E_NOT_SUFFICIENT_BUFFER but writes the needed count).
                     let mut count = 0u32;
-                    let _ = layout.HitTestTextRange(s0, s1 - s0, pad(), pad(), None, &mut count);
+                    let _ = layout.HitTestTextRange(
+                        s0,
+                        s1 - s0,
+                        pad(),
+                        header_y + pad(),
+                        None,
+                        &mut count,
+                    );
                     if count > 0 {
                         let mut rects =
                             vec![DWRITE_HIT_TEST_METRICS::default(); count as usize];
                         let mut got = 0u32;
                         if layout
-                            .HitTestTextRange(s0, s1 - s0, pad(), pad(), Some(&mut rects), &mut got)
+                            .HitTestTextRange(
+                                s0,
+                                s1 - s0,
+                                pad(),
+                                header_y + pad(),
+                                Some(&mut rects),
+                                &mut got,
+                            )
                             .is_ok()
                         {
                             for m in &rects[..got.min(count) as usize] {
@@ -297,7 +349,10 @@ impl TextRenderer {
                 }
             }
             self.dc.DrawTextLayout(
-                Vector2 { X: pad(), Y: pad() },
+                Vector2 {
+                    X: pad(),
+                    Y: header_y + pad(),
+                },
                 &layout,
                 if empty {
                     &self.placeholder_brush
@@ -315,7 +370,7 @@ impl TextRenderer {
                     .is_ok()
                 {
                     let x = pad() + cx;
-                    let y = pad() + cy;
+                    let y = header_y + pad() + cy;
                     let rect = D2D_RECT_F {
                         left: x,
                         top: y,
@@ -415,12 +470,16 @@ impl TextRenderer {
         Ok(())
     }
 
-    /// Draw the startup pill: a left-aligned "Launch on startup" label plus a
-    /// minimalist monochrome toggle near the right edge — a stroked pill
-    /// track with a filled knob at its right end when `on`, left when off
-    /// (the track interior also fills lightly when on, so it reads engaged).
-    /// All white coverage; the shader picks the ink colour.
-    pub fn draw_startup(&self, target: &ID2D1Bitmap1, w: u32, h: u32, on: bool) -> Result<()> {
+    /// Draw a settings toggle: a left-aligned label plus the existing
+    /// minimalist monochrome switch near the right edge.
+    fn draw_toggle(
+        &self,
+        target: &ID2D1Bitmap1,
+        w: u32,
+        h: u32,
+        label_txt: &str,
+        on: bool,
+    ) -> Result<()> {
         unsafe {
             let (wf, hf) = (w as f32, h as f32);
             let s = crate::scale::ui_scale();
@@ -445,7 +504,7 @@ impl TextRenderer {
                 w!(""),
             )?;
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-            let label: Vec<u16> = "Launch on startup".encode_utf16().collect();
+            let label: Vec<u16> = label_txt.encode_utf16().collect();
             let label_x = 18.0 * s;
             let layout = self.dwrite.CreateTextLayout(
                 &label,
@@ -511,6 +570,20 @@ impl TextRenderer {
             self.dc.SetTarget(None);
         }
         Ok(())
+    }
+
+    pub fn draw_startup(&self, target: &ID2D1Bitmap1, w: u32, h: u32, on: bool) -> Result<()> {
+        self.draw_toggle(target, w, h, "Launch on startup", on)
+    }
+
+    pub fn draw_slide_hidden(
+        &self,
+        target: &ID2D1Bitmap1,
+        w: u32,
+        h: u32,
+        on: bool,
+    ) -> Result<()> {
+        self.draw_toggle(target, w, h, "Slide out hidden notes", on)
     }
 
     /// Draw a settings slider pill: a left-aligned `label_txt` plus a 5-stop
@@ -671,14 +744,24 @@ impl TextRenderer {
     /// Map a point in note-local pixels to a caret position (UTF-16 units),
     /// using the same layout geometry as `draw`. A trailing-edge hit lands
     /// the caret after the hit character.
-    pub fn hit_test(&self, w: u32, h: u32, text: &str, font_size: f32, x: f32, y: f32) -> u32 {
+    pub fn hit_test(
+        &self,
+        w: u32,
+        h: u32,
+        text: &str,
+        font_size: f32,
+        x: f32,
+        y: f32,
+        header_frac: f32,
+    ) -> u32 {
         let utf16: Vec<u16> = text.encode_utf16().collect();
+        let header_y = header() * header_frac.clamp(0.0, 1.0);
         unsafe {
             let Ok(layout) = self.dwrite.CreateTextLayout(
                 &utf16,
                 &self.format,
                 (w as f32 - 2.0 * pad()).max(1.0),
-                (h as f32 - 2.0 * pad()).max(1.0),
+                (h as f32 - header_y - 2.0 * pad()).max(1.0),
             ) else {
                 return 0;
             };
@@ -693,7 +776,13 @@ impl TextRenderer {
             let mut inside = BOOL(0);
             let mut m = DWRITE_HIT_TEST_METRICS::default();
             if layout
-                .HitTestPoint(x - pad(), y - pad(), &mut trailing, &mut inside, &mut m)
+                .HitTestPoint(
+                    x - pad(),
+                    y - header_y - pad(),
+                    &mut trailing,
+                    &mut inside,
+                    &mut m,
+                )
                 .is_ok()
             {
                 m.textPosition + if trailing.as_bool() { 1 } else { 0 }
@@ -714,8 +803,10 @@ impl TextRenderer {
         text: &str,
         font_size: f32,
         caret_utf16: u32,
+        header_frac: f32,
     ) -> Option<(f32, f32, f32)> {
         let utf16: Vec<u16> = text.encode_utf16().collect();
+        let header_y = header() * header_frac.clamp(0.0, 1.0);
         unsafe {
             let layout = self
                 .dwrite
@@ -723,7 +814,7 @@ impl TextRenderer {
                     &utf16,
                     &self.format,
                     (w as f32 - 2.0 * pad()).max(1.0),
-                    (h as f32 - 2.0 * pad()).max(1.0),
+                    (h as f32 - header_y - 2.0 * pad()).max(1.0),
                 )
                 .ok()?;
             let _ = layout.SetFontSize(
@@ -739,7 +830,11 @@ impl TextRenderer {
             layout
                 .HitTestTextPosition(caret_utf16, false, &mut cx, &mut cy, &mut m)
                 .ok()?;
-            Some((pad() + cx, pad() + cy, m.height.max(font_size)))
+            Some((
+                pad() + cx,
+                header_y + pad() + cy,
+                m.height.max(font_size),
+            ))
         }
     }
 

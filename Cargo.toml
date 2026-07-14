@@ -1,6 +1,6 @@
 [package]
 name = "liquidnotes"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Sticky notes with a real liquid-glass material: GPU desktop capture + refraction shader"
 license = "MIT"

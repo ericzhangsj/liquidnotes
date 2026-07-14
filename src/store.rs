@@ -27,16 +27,20 @@ pub struct Store {
     /// Effective UI scale (display DPI × user_scale) the note pixels below were
     /// laid out at, so a load on a different-DPI display can rescale them.
     pub layout_scale: f32,
+    /// When enabled, directly hovering a docked sliver reveals the full note;
+    /// click/focus keeps it open until focus leaves or it is dragged away.
+    pub slide_out_hidden_notes: bool,
     pub notes: Vec<NoteData>,
 }
 
 impl Default for Store {
     fn default() -> Self {
         Store {
-            version: 1,
+            version: 3,
             next_id: 1,
             user_scale: 1.0,
             layout_scale: 1.0,
+            slide_out_hidden_notes: false,
             notes: Vec::new(),
         }
     }
@@ -99,11 +103,12 @@ pub(crate) fn save_atomic_to(path: &Path, store: &Store) -> std::io::Result<()> 
 pub(crate) fn to_json(store: &Store) -> String {
     let mut s = String::with_capacity(64 + store.notes.len() * 128);
     s.push_str(&format!(
-        "{{\"version\":{},\"next_id\":{},\"user_scale\":{},\"layout_scale\":{},\"notes\":[",
+        "{{\"version\":{},\"next_id\":{},\"user_scale\":{},\"layout_scale\":{},\"slide_out_hidden_notes\":{},\"notes\":[",
         store.version,
         store.next_id,
         fmt_f32(store.user_scale),
-        fmt_f32(store.layout_scale)
+        fmt_f32(store.layout_scale),
+        store.slide_out_hidden_notes
     ));
     for (i, n) in store.notes.iter().enumerate() {
         if i > 0 {
@@ -443,6 +448,10 @@ pub(crate) fn parse(s: &str) -> Option<Store> {
         .map(|v| v as f32)
         .filter(|v| *v > 0.0)
         .unwrap_or(1.0);
+    let slide_out_hidden_notes = match root.get("slide_out_hidden_notes") {
+        Some(Json::Bool(v)) => *v,
+        _ => false,
+    };
 
     let mut notes = Vec::new();
     if let Some(Json::Arr(items)) = root.get("notes") {
@@ -457,6 +466,7 @@ pub(crate) fn parse(s: &str) -> Option<Store> {
         next_id,
         user_scale,
         layout_scale,
+        slide_out_hidden_notes,
         notes,
     })
 }
@@ -520,6 +530,7 @@ mod tests {
             next_id: 7,
             user_scale: 1.25,
             layout_scale: 1.5,
+            slide_out_hidden_notes: true,
             notes: vec![
                 NoteData {
                     id: 1,
@@ -587,6 +598,7 @@ mod tests {
         ]}"#;
         let store = parse(json).expect("parse failed");
         assert_eq!(store.next_id, 9);
+        assert!(!store.slide_out_hidden_notes);
         assert_eq!(store.notes.len(), 1);
         let n = &store.notes[0];
         assert_eq!(n.id, 2);

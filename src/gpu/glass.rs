@@ -28,7 +28,7 @@ struct Params {
     frost: [f32; 4],  // sigma, margin_m_px, 1/blurTexW, 1/blurTexH
     cursor: [f32; 4], // minU, minV, maxU, maxV (2.0s = no cursor)
     blur: [f32; 4],   // sigma, radius_texels, dirX, dirY (psblur only)
-    light: [f32; 4],  // intensity, angle_rad, elevation_rad, spare (psglass only)
+    light: [f32; 4],  // intensity, angle_rad, danger tint, fill opacity (psglass)
     fx: [f32; 4],     // reveal, glow, active (fill opacity bump), spare
     txt: [f32; 4],    // text layer: SS factor, 1/texW, 1/texH, spare (psglass only)
 }
@@ -181,7 +181,8 @@ impl GlassRenderer {
                 .CreateShaderResourceView(&tex, None, Some(&mut srv))?;
             let bitmap = self.text.make_target(&tex)?;
             // Clear to transparent so the first composite shows no garbage.
-            self.text.draw(&bitmap, w, h, "", &[], 0, false, 16.0, None)?;
+            self.text
+                .draw(&bitmap, w, h, "", &[], 0, false, 16.0, None, 0.0)?;
             Ok((tex, srv.unwrap(), bitmap))
         }
     }
@@ -197,6 +198,7 @@ impl GlassRenderer {
         show_caret: bool,
         font_size: f32,
         sel: Option<(u32, u32)>,
+        header_frac: f32,
     ) -> Result<()> {
         self.text.draw(
             &s.text_bitmap,
@@ -208,6 +210,7 @@ impl GlassRenderer {
             show_caret,
             font_size,
             sel,
+            header_frac,
         )
     }
 
@@ -229,6 +232,13 @@ impl GlassRenderer {
         self.text.draw_startup(&s.text_bitmap, s.width, s.height, on)
     }
 
+    /// Draw the persisted hidden-note hover-reveal toggle using the same visual
+    /// language as the launch-on-startup switch.
+    pub fn draw_slide_hidden(&self, s: &Surface, on: bool) -> Result<()> {
+        self.text
+            .draw_slide_hidden(&s.text_bitmap, s.width, s.height, on)
+    }
+
     /// Draw the opacity pill's label + slider (`frac` = 0..1 knob position).
     pub fn draw_opacity(&self, s: &Surface, frac: f32) -> Result<()> {
         self.text
@@ -241,8 +251,17 @@ impl GlassRenderer {
     }
 
     /// Map a note-local point to a caret position (UTF-16 units) in `text`.
-    pub fn hit_test_text(&self, s: &Surface, text: &str, font_size: f32, x: f32, y: f32) -> u32 {
-        self.text.hit_test(s.width, s.height, text, font_size, x, y)
+    pub fn hit_test_text(
+        &self,
+        s: &Surface,
+        text: &str,
+        font_size: f32,
+        x: f32,
+        y: f32,
+        header_frac: f32,
+    ) -> u32 {
+        self.text
+            .hit_test(s.width, s.height, text, font_size, x, y, header_frac)
     }
 
     /// Laid-out height (px) of `text` at `font_size` in a `max_w`-wide column.
@@ -282,9 +301,17 @@ impl GlassRenderer {
         text: &str,
         font_size: f32,
         caret_utf16: u32,
+        header_frac: f32,
     ) -> Option<(f32, f32, f32)> {
         self.text
-            .caret_point(s.width, s.height, text, font_size, caret_utf16)
+            .caret_point(
+                s.width,
+                s.height,
+                text,
+                font_size,
+                caret_utf16,
+                header_frac,
+            )
     }
 
     pub fn create_surface(&self, hwnd: HWND, width: u32, height: u32) -> Result<Surface> {
@@ -496,6 +523,7 @@ impl GlassRenderer {
         glow: f32,
         active: f32,
         cmix: f32,
+        danger_tint: f32,
     ) -> Result<()> {
         let (w, h) = (s.width, s.height);
         let desk = [
@@ -539,7 +567,7 @@ impl GlassRenderer {
             light: [
                 mat.lighting,
                 mat.light_angle.to_radians(),
-                0.0,
+                danger_tint.clamp(0.0, 1.0),
                 mat.opacity,
             ],
             fx: [

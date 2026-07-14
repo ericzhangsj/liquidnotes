@@ -2,7 +2,7 @@
 //!
 //! MVP surface: a ➕ button pinned to the bottom-right of the work area
 //! (left-click: spawn a note stacked above it; right-click: an animated pill
-//! menu — Quit and a launch-on-startup toggle — fanning out to its left),
+//! menu — toggles/sliders and Quit — fanning out to its left),
 //! and frameless resizable glass notes. Every window is a
 //! WS_EX_NOREDIRECTIONBITMAP popup whose pixels come entirely from the
 //! DirectComposition swapchain rendered by the glass engine.
@@ -15,10 +15,16 @@ use liquidnotes::gpu::glass::{GlassRenderer, Surface};
 use liquidnotes::material::GlassMaterial;
 use liquidnotes::scale::{sc, scf, set_ui_scale, ui_scale};
 use liquidnotes::store::{self, NoteData, Store};
-use liquidnotes::text::{A_BOLD, A_ITALIC, A_STRIKE, OP_TRACK_L, OP_TRACK_R, PAD};
+use liquidnotes::text::{
+    A_BOLD, A_ITALIC, A_STRIKE, NOTE_HEADER, OP_TRACK_L, OP_TRACK_R, PAD,
+};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -54,25 +60,75 @@ const TUCK_WAKE_RADIUS: f32 = 8.0;
 /// clear room for the note-sized settings column on the +'s right.
 const MENU_DX: i32 = NOTE_W + STACK_GAP;
 const NOTE_W: i32 = 340;
-/// Fresh notes spawn one text line tall (2*PAD + one 16 px line ≈ 66): a long
-/// pill that auto-height grows as content arrives.
-const NOTE_H: i32 = 66;
+/// Fresh notes retain the original one-line body and add a compact handle area
+/// above it; auto-height growth still comes only from the text body.
+const NOTE_BODY_H: i32 = 66;
+const NOTE_H: i32 = NOTE_BODY_H;
+const PILL_H: i32 = NOTE_BODY_H;
 const NOTE_MIN_W: i32 = 170;
-const NOTE_MIN_H: i32 = 66;
+const NOTE_MIN_H: i32 = NOTE_H;
 const NOTE_MAX_W: i32 = 760;
 const STACK_GAP: i32 = 12;
+
+fn header_px(frac: f32) -> i32 {
+    (scf(NOTE_HEADER) * frac.clamp(0.0, 1.0)).round() as i32
+}
+
+/// Notes separated by the resting gap behave like a vertical chain. Starting at
+/// `root`, return every horizontally-overlapping note in the same non-zero group
+/// connected above it. Groups keep ordinary free notes and each monitor/edge's
+/// hidden notes independent. A little rounding tolerance keeps the chain intact
+/// across fractional DPI scales, while a deliberately dragged-away note leaves it.
+fn note_chain_above(root: usize, rects: &[RECT], groups: &[u32], gap: i32) -> Vec<usize> {
+    if root >= rects.len() || root >= groups.len() || groups[root] == 0 {
+        return Vec::new();
+    }
+
+    let root_group = groups[root];
+    let tolerance = (scf(1.5).ceil() as i32).max(1);
+    let mut seen = vec![false; rects.len()];
+    let mut queue = vec![root];
+    let mut result = Vec::new();
+    seen[root] = true;
+
+    while let Some(lower) = queue.pop() {
+        let lr = rects[lower];
+        for upper in 0..rects.len() {
+            if seen[upper] || groups.get(upper).copied().unwrap_or(0) != root_group {
+                continue;
+            }
+            let ur = rects[upper];
+            let x_overlap = lr.right.min(ur.right) - lr.left.max(ur.left);
+            let actual_gap = lr.top - ur.bottom;
+            if x_overlap > 0 && (actual_gap - gap).abs() <= tolerance {
+                seen[upper] = true;
+                queue.push(upper);
+                result.push(upper);
+            }
+        }
+    }
+
+    result
+}
 /// Soft drop-shadow halo (px) around a note, drawn in a companion window
 /// inflated by this margin. Kept below STACK_GAP so a note's shadow never
 /// reaches its stacked neighbours (no per-note z-ordering needed).
 const SHADOW_MARGIN: i32 = 8;
-/// Cursor must be within this many px of a work-area L/R edge on drop to dock.
-const DOCK_TRIGGER: i32 = 14;
+/// Cursor edge zone in DIPs. It is converted with the cursor monitor's DPI,
+/// not the app's global/manual note scale, and drives both docking and the blue
+/// snap outline.
+const DOCK_CURSOR_RADIUS_DIP: f32 = 50.0;
 /// Fraction of a docked note's width left poking on-screen (the sliver).
 const DOCK_SLIVER: f32 = 0.10;
 /// Fraction shown while the sliver is hovered (peek).
 const DOCK_PEEK: f32 = 0.20;
-/// Vertical gap kept between notes docked on the same edge.
-const DOCK_GAP: i32 = 6;
+/// With slide-out enabled, direct hover reveals the full note this far inward;
+/// clicking/focusing advances it to the second, more pronounced stop.
+const DOCK_HOVER_INSET_DIP: f32 = 5.0;
+const DOCK_CLICK_INSET_DIP: f32 = 10.0;
+/// Vertical gap between notes docked on the same edge. Match the free-note and
+/// stack spacing so moving a note into the border does not tighten the layout.
+const DOCK_GAP: i32 = STACK_GAP;
 
 /// Manual size-slider stops: a multiplier applied on top of the auto-DPI scale
 /// (index 2 = 1.0 = auto only). Lets the user nudge everything bigger/smaller.
@@ -110,8 +166,6 @@ fn slider_frac_at(hwnd: HWND) -> f32 {
 /// don't otherwise need — the message id itself is all we use).
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const RESIZE_BORDER: i32 = 9;
-/// Top strip of a note that acts as a drag handle (below it is the text body).
-const DRAG_STRIP: i32 = 26;
 const IDM_NEW: u32 = 1;
 const IDM_QUIT: u32 = 2;
 const IDM_BACKDROP: u32 = 3;
@@ -148,9 +202,10 @@ struct Win {
     /// is never dragged, edited, focused, stacked, proximity-lit, auto-height
     /// resized, or persisted.
     is_pill: bool,
-    /// Which pill this is: 0 = Quit, 1 = launch-on-startup toggle.
+    /// Which pill this is: 0 Quit, 1 startup toggle, 2 opacity slider,
+    /// 3 size slider, 4 slide-out-hidden-notes toggle.
     pill_kind: u8,
-    /// Startup-toggle state shown on the pill (kind 1 only).
+    /// Toggle state shown on kinds 1 and 4.
     pill_on: bool,
     /// Editable text buffer (char-indexed) and caret position (char offset).
     text: Vec<char>,
@@ -167,6 +222,10 @@ struct Win {
     docked: i8,
     /// TrackMouseEvent(TME_LEAVE) armed on this docked sliver (peek hover).
     tracking: bool,
+    /// A note just dropped into an edge must see one real mouse-leave before
+    /// hover reveal is allowed; otherwise the release cursor pops it straight
+    /// back out before the user has moved away.
+    dock_hover_blocked: bool,
     color: u8,
     font_size: f32,
     /// User-chosen height floor for auto-height (0 = fully automatic); set
@@ -187,8 +246,16 @@ struct Win {
     /// opaque in the shader); eased toward active_to by anim_tick.
     active: f32,
     active_to: f32,
+    /// Hover-only top handle expansion: 0 = original compact body, 1 = the
+    /// full NOTE_HEADER area grown upward while the body stays anchored.
+    header: f32,
+    header_to: f32,
     /// Stack relayout tween target (top-left, screen px); None when settled.
     pos_to: Option<(i32, i32)>,
+    /// Fractional X state for dock reveal/retract. Unlike ordinary integer
+    /// window glides this can visibly ease a tiny 5-DIP stage without forced
+    /// 1px-per-frame steps. `(current_x, target_x)`.
+    dock_ease_x: Option<(f32, f32)>,
     /// Flick-to-delete velocity in px/s while being hurled off-screen.
     fling: Option<(f32, f32)>,
     /// Throw-spin state while flinging: current rotation (degrees, applied
@@ -196,7 +263,7 @@ struct Win {
     /// angular velocity (deg/s, from the grab-offset × velocity torque).
     angle: f32,
     spin: f32,
-    /// Gentle drift-up+fade close in progress (Ctrl+W / [×]).
+    /// Gentle drift-up+fade close in progress (Ctrl+W).
     closing: bool,
     /// Fade/fling finished; the main loop destroys this window next reap.
     dying: bool,
@@ -241,6 +308,9 @@ struct Drag {
     /// Cursor offset from the window's top-left at grab time.
     grab_dx: i32,
     grab_dy: i32,
+    /// Cursor position at grab time. A short reposition must never be mistaken
+    /// for the deliberate throw gesture, even after one noisy mouse sample.
+    start_pos: POINT,
     /// True once the cursor travelled past the click-slop threshold (4 px).
     moved: bool,
     /// Last cursor position/time, for velocity tracking.
@@ -249,6 +319,54 @@ struct Drag {
     /// Smoothed cursor velocity in px/s (for the later flick gesture).
     vx: f32,
     vy: f32,
+}
+
+/// A release must exceed this speed to become a flick-to-delete.
+const FLING_DELETE_SPEED: f32 = 2000.0;
+const FLING_DELETE_TRAVEL_DIP: f32 = 110.0;
+/// Clamp pathological mouse samples so a note never teleports off-screen in a
+/// single frame. Direction is preserved by scaling both velocity components.
+const FLING_MAX_SPEED: f32 = 4200.0;
+/// Even a centre-grab / zero-torque throw should visibly tumble before fading.
+const FLING_MIN_SPIN: f32 = 360.0;
+const FLING_MAX_SPIN: f32 = 1440.0;
+/// Thrown notes fade for twice as long as ordinary reveal/close transitions.
+const FLING_FADE_TIME_SCALE: f32 = 2.0;
+
+/// Convert the measured drag velocity and grab offset into bounded linear and
+/// angular fling motion. Real grab-offset torque chooses the rotation direction
+/// whenever it is meaningful; otherwise the throw direction supplies a stable
+/// fallback, so every deleted note rotates.
+fn fling_motion(vx: f32, vy: f32, rgx: f32, rgy: f32) -> ((f32, f32), f32) {
+    let speed = vx.hypot(vy);
+    let velocity_scale = if speed > FLING_MAX_SPEED {
+        FLING_MAX_SPEED / speed
+    } else {
+        1.0
+    };
+    let fling = (vx * velocity_scale, vy * velocity_scale);
+
+    let raw_spin = (rgx * vy - rgy * vx) * 0.0020;
+    let fallback_sign = if vx.abs() >= vy.abs() {
+        vx.signum()
+    } else if rgx.abs() > 1.0 {
+        (rgx * vy).signum()
+    } else {
+        vy.signum()
+    };
+    let spin_sign = if raw_spin.abs() > 0.01 {
+        raw_spin.signum()
+    } else if fallback_sign == 0.0 {
+        1.0
+    } else {
+        fallback_sign
+    };
+    let spin = if raw_spin.abs() < FLING_MIN_SPIN {
+        spin_sign * FLING_MIN_SPIN
+    } else {
+        raw_spin.clamp(-FLING_MAX_SPIN, FLING_MAX_SPIN)
+    };
+    (fling, spin)
 }
 
 /// One reversible text-edit state of a note (Ctrl+Z / Ctrl+Y).
@@ -317,8 +435,11 @@ struct App {
     last_click_y: i32,
     last_click_idx: usize,
     click_count: u32,
-    /// The [+] pill menu is showing (Quit + startup pills, catcher armed).
+    /// The [+] settings pill menu is showing (catcher armed).
     menu_open: bool,
+    /// Persisted settings toggle: reveal docked notes fully on direct hover and
+    /// keep them open for editing until focus leaves or a drag undocks them.
+    slide_out_hidden_notes: bool,
     /// Fullscreen invisible click-catcher under the pills (dismiss on any
     /// outside click). Not in `windows` — it has no glass surface.
     catcher: Option<HWND>,
@@ -344,6 +465,11 @@ struct App {
     /// its reentrant per-note relayout — rescale_all does one clean layout pass
     /// at the end instead.
     rescaling: bool,
+    /// Suppresses normal manual-resize relayout during hover-header animation.
+    header_resizing: bool,
+    /// Docked note currently in Windows' modal border-resize loop. Keeping this
+    /// explicit prevents its hover header from collapsing under the resize grip.
+    manual_sizing: Option<usize>,
     /// A settings slider (Opacity/Size pill) being dragged: its window index and
     /// the live knob position (0..1). The knob tracks the cursor while dragging;
     /// the value is only committed (and snapped to a level) on button-up.
@@ -415,6 +541,7 @@ fn main() -> Result<()> {
         last_click_idx: usize::MAX,
         click_count: 0,
         menu_open: false,
+        slide_out_hidden_notes: false,
         catcher: None,
         tuck: 0.0,
         tuck_to: 0.0,
@@ -424,6 +551,8 @@ fn main() -> Result<()> {
         dpi_scale,
         user_scale: 1.0,
         rescaling: false,
+        header_resizing: false,
+        manual_sizing: None,
         slider_drag: None,
         slider_frac: 0.0,
     });
@@ -520,6 +649,7 @@ fn main() -> Result<()> {
         // Restore persisted notes before entering the message loop.
         let saved = store::load();
         app.next_id = saved.next_id.max(1);
+        app.slide_out_hidden_notes = saved.slide_out_hidden_notes;
         // Apply the persisted manual size multiplier, then rescale the saved
         // note pixels from the scale they were written at to the current
         // effective scale — so opening notes on a higher-DPI display (or after
@@ -529,9 +659,17 @@ fn main() -> Result<()> {
         let load_ratio = ui_scale() / saved.layout_scale;
         for n in &saved.notes {
             let nw = ((n.w as f32 * load_ratio).round() as i32).max(1);
-            let nh = ((n.h as f32 * load_ratio).round() as i32).max(1);
+            let stored_header = if saved.version == 2 {
+                scf(NOTE_HEADER).round() as i32
+            } else {
+                0
+            };
+            let nh = ((n.h as f32 * load_ratio).round() as i32 - stored_header).max(1);
             let sx = (n.x as f32 * load_ratio).round() as i32;
-            let sy = (n.y as f32 * load_ratio).round() as i32;
+            // Version 2 persisted the always-visible header. Version 3 stores
+            // only the compact body; remove that old header once while keeping
+            // the body and bottom edge in the same place.
+            let sy = (n.y as f32 * load_ratio).round() as i32 + stored_header;
             // A note saved on a now-disconnected monitor comes back on-screen
             // (docked notes recompute from the current work area below).
             let (nx, ny) = if n.docked == 0 {
@@ -555,12 +693,18 @@ fn main() -> Result<()> {
                 // the current work area (absorbs screen-size changes).
                 if n.docked != 0 {
                     let hwnd = app.windows[i].hwnd;
-                    let wa = work_area();
+                    // Probe the saved visible edge so a docked note returns to
+                    // the same monitor rather than the primary monitor.
+                    let probe = POINT {
+                        x: if n.docked < 0 { sx + nw - 1 } else { sx + 1 },
+                        y: sy + nh / 2,
+                    };
+                    let wa = monitor_area_at(probe).work;
                     let _ = SetWindowPos(
                         hwnd,
                         None,
-                        App::dock_x(n.docked, n.w, DOCK_SLIVER, &wa),
-                        n.y,
+                        App::dock_x(n.docked, nw, DOCK_SLIVER, &wa),
+                        sy,
                         0,
                         0,
                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE,
@@ -572,6 +716,19 @@ fn main() -> Result<()> {
         // Snap loaded stacked notes into the current column layout (left of the
         // +), so a saved right-aligned layout doesn't linger until first edit.
         app.relayout_stack(false);
+        // Older builds could persist overlapping docked slivers. Re-run each
+        // edge's complete chain layout once at startup so those bad positions
+        // repair themselves immediately instead of waiting for another drop.
+        let docked: Vec<(usize, i8, MonitorArea)> = app
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.is_note() && w.docked != 0)
+            .map(|(i, w)| (i, w.docked, monitor_area_for_window(w.hwnd)))
+            .collect();
+        for (i, side, area) in docked {
+            app.dock_note(i, side, area);
+        }
 
         // Poll capture on a high-resolution waitable timer instead of a plain
         // millisecond timeout: the default system timer granularity is ~15 ms,
@@ -660,6 +817,58 @@ fn work_area() -> RECT {
         );
     }
     r
+}
+
+#[derive(Clone, Copy)]
+struct MonitorArea {
+    handle: HMONITOR,
+    work: RECT,
+    dpi: u32,
+}
+
+/// Physical work area + effective DPI for one monitor. The 96-DPI fallback is
+/// deliberately independent of the user's note-size slider.
+fn monitor_area(handle: HMONITOR) -> MonitorArea {
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let work = unsafe {
+        if GetMonitorInfoW(handle, &mut info).as_bool() {
+            info.rcWork
+        } else {
+            work_area()
+        }
+    };
+    let mut dpi_x = 96u32;
+    let mut dpi_y = 96u32;
+    unsafe {
+        let _ = GetDpiForMonitor(
+            handle,
+            MDT_EFFECTIVE_DPI,
+            &mut dpi_x as *mut _,
+            &mut dpi_y as *mut _,
+        );
+    }
+    MonitorArea {
+        handle,
+        work,
+        dpi: dpi_x.max(1),
+    }
+}
+
+fn monitor_area_at(p: POINT) -> MonitorArea {
+    let handle = unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST) };
+    monitor_area(handle)
+}
+
+fn monitor_area_for_window(hwnd: HWND) -> MonitorArea {
+    let handle = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    monitor_area(handle)
+}
+
+fn dip_to_monitor_px(dip: f32, dpi: u32) -> i32 {
+    (dip * dpi as f32 / 96.0).round() as i32
 }
 
 /// Clamp a saved note rect onto the current virtual desktop. A note that is
@@ -797,6 +1006,100 @@ unsafe extern "system" fn catcher_proc(
     }
 }
 
+#[cfg(test)]
+mod fling_tests {
+    use super::*;
+
+    #[test]
+    fn caps_linear_speed_without_changing_direction() {
+        let ((vx, vy), _) = fling_motion(9000.0, 12000.0, 0.0, 0.0);
+        assert!((vx.hypot(vy) - FLING_MAX_SPEED).abs() < 0.01);
+        assert!((vx / vy - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn centre_grab_always_gets_visible_spin() {
+        let (_, left_spin) = fling_motion(-3000.0, 0.0, 0.0, 0.0);
+        let (_, right_spin) = fling_motion(3000.0, 0.0, 0.0, 0.0);
+        let (_, up_spin) = fling_motion(0.0, -3000.0, 0.0, 0.0);
+        let (_, down_spin) = fling_motion(0.0, 3000.0, 0.0, 0.0);
+        assert_eq!(left_spin, -FLING_MIN_SPIN);
+        assert_eq!(right_spin, FLING_MIN_SPIN);
+        assert_eq!(up_spin, -FLING_MIN_SPIN);
+        assert_eq!(down_spin, FLING_MIN_SPIN);
+    }
+
+    #[test]
+    fn weak_torque_keeps_its_direction_but_uses_minimum_spin() {
+        let (_, spin) = fling_motion(2500.0, 0.0, 0.0, -10.0);
+        assert_eq!(spin, FLING_MIN_SPIN);
+    }
+
+    #[test]
+    fn extreme_torque_is_capped() {
+        let (_, spin) = fling_motion(4000.0, 4000.0, 1000.0, -1000.0);
+        assert_eq!(spin, FLING_MAX_SPIN);
+    }
+
+    #[test]
+    fn dock_radius_uses_monitor_dpi_not_manual_ui_scale() {
+        assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 96), 50);
+        assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 144), 75);
+        assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 192), 100);
+    }
+
+    fn test_rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+
+    #[test]
+    fn header_chain_collects_every_connected_note_above() {
+        let rects = [
+            test_rect(0, 200, 100, 266),
+            test_rect(0, 122, 100, 188),
+            test_rect(0, 44, 100, 110),
+        ];
+        assert_eq!(
+            note_chain_above(0, &rects, &[1, 1, 1], 12),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn header_chain_ignores_side_and_ineligible_notes() {
+        let rects = [
+            test_rect(0, 200, 100, 266),
+            test_rect(100, 122, 200, 188),
+            test_rect(0, 122, 100, 188),
+        ];
+        assert!(note_chain_above(0, &rects, &[1, 1, 0], 12).is_empty());
+    }
+
+    #[test]
+    fn dragging_a_note_away_breaks_the_header_chain() {
+        let rects = [
+            test_rect(0, 200, 100, 266),
+            test_rect(0, 110, 100, 176),
+        ];
+        assert!(note_chain_above(0, &rects, &[1, 1], 12).is_empty());
+    }
+
+    #[test]
+    fn border_chain_does_not_cross_groups() {
+        let rects = [
+            test_rect(0, 200, 100, 266),
+            test_rect(0, 122, 100, 188),
+            test_rect(0, 44, 100, 110),
+        ];
+        assert_eq!(note_chain_above(0, &rects, &[2, 2, 3], 12), vec![1]);
+    }
+}
+
 impl App {
     fn create_window(
         &mut self,
@@ -849,6 +1152,7 @@ impl App {
                 free: true,
                 docked: 0,
                 tracking: false,
+                dock_hover_blocked: false,
                 color: 0,
                 font_size: scf(16.0),
                 manual_h: 0,
@@ -861,7 +1165,10 @@ impl App {
                 glow_to: 0.0,
                 active: 0.0,
                 active_to: 0.0,
+                header: 0.0,
+                header_to: 0.0,
                 pos_to: None,
+                dock_ease_x: None,
                 fling: None,
                 angle: 0.0,
                 spin: 0.0,
@@ -981,6 +1288,7 @@ impl App {
                 self.windows[i].pos_to = Some((x, y));
             } else {
                 self.windows[i].pos_to = None;
+                self.windows[i].dock_ease_x = None;
                 unsafe {
                     let _ = SetWindowPos(
                         self.windows[i].hwnd,
@@ -1074,45 +1382,213 @@ impl App {
         }
     }
 
+    /// Ease a still-docked note to a visibility fraction. `inset_dip` moves a
+    /// fully revealed note a little farther INTO the monitor (right on the left
+    /// edge, left on the right edge) while retaining its dock identity.
+    fn slide_docked_to(&mut self, idx: usize, frac: f32, inset_dip: f32) {
+        if idx >= self.windows.len() || self.windows[idx].docked == 0 {
+            return;
+        }
+        let side = self.windows[idx].docked;
+        let hwnd = self.windows[idx].hwnd;
+        let r = self.rect_of(idx);
+        let area = monitor_area_for_window(hwnd);
+        let mut x = Self::dock_x(side, r.right - r.left, frac, &area.work);
+        let inset = dip_to_monitor_px(inset_dip, area.dpi);
+        x += if side < 0 { inset } else { -inset };
+        let y = self.windows[idx].pos_to.map(|(_, y)| y).unwrap_or(r.top);
+        let target = (x, y);
+        if r.left == x && r.top == y && self.windows[idx].pos_to.is_none() {
+            return;
+        }
+        if self.windows[idx].pos_to == Some(target)
+            && self.windows[idx]
+                .dock_ease_x
+                .map(|(_, tx)| (tx - x as f32).abs() < 0.01)
+                .unwrap_or(false)
+        {
+            return;
+        }
+        self.windows[idx].pos_to = Some(target);
+        self.windows[idx].dock_ease_x = Some((r.left as f32, x as f32));
+        self.start_anim_timer();
+    }
+
+    /// Which edge is this free note being dragged/dropped into? Docking is based
+    /// exclusively on the CURSOR entering the monitor's edge zone. The note's
+    /// rectangle and intersections with existing slivers do not activate it.
+    fn dock_side_for_drop(&self, idx: usize, cursor: POINT) -> Option<(i8, MonitorArea)> {
+        if idx >= self.windows.len() || !self.windows[idx].is_note() {
+            return None;
+        }
+        let area = monitor_area_at(cursor);
+        let wa = area.work;
+        let cursor_radius = dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, area.dpi);
+        let touches_left = cursor.x <= wa.left + cursor_radius;
+        let touches_right = cursor.x >= wa.right - cursor_radius;
+        let side = match (touches_left, touches_right) {
+            (true, false) => -1,
+            (false, true) => 1,
+            (true, true) => {
+                // A very wide note can reach both edges: choose the one nearest
+                // the cursor, since that is the user's docking gesture.
+                let cx = cursor.x as i64;
+                let mid = (wa.left as i64 + wa.right as i64) / 2;
+                if cx <= mid { -1 } else { 1 }
+            }
+            (false, false) => return None,
+        };
+        Some((side, area))
+    }
+
     /// Dock a note against the left (side=-1) or right (side=1) work-area
-    /// edge as a sliver, sliding down past notes already docked on that side
-    /// so the slivers never overlap.
-    fn dock_note(&mut self, idx: usize, side: i8) {
+    /// edge as a sliver. Reflow every sliver on that edge as one vertical
+    /// chain, so dropping onto another sliver pushes its neighbours out of the
+    /// way instead of relying on a downward-only search that can overlap again
+    /// when clamped at the bottom of the work area.
+    fn dock_note(&mut self, idx: usize, side: i8, area: MonitorArea) {
         if idx >= self.windows.len() || !self.windows[idx].is_note() || side == 0 {
             return;
         }
-        let wa = work_area();
-        let mut r = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(self.windows[idx].hwnd, &mut r);
-        }
-        let (w, h) = (r.right - r.left, r.bottom - r.top);
-        // Bands [top, bottom) of the other notes docked on this side, using
-        // their animation target when one is still gliding into place.
-        let mut bands: Vec<(i32, i32)> = Vec::new();
+        let wa = area.work;
+        self.windows[idx].docked = side;
+        self.windows[idx].free = true;
+
+        // (window index, desired top, width, height). A still-gliding note's
+        // target is authoritative; using its intermediate window rect here can
+        // otherwise make two quick drops choose the same slot.
+        let mut items: Vec<(usize, i32, i32, i32)> = Vec::new();
         for (i, win) in self.windows.iter().enumerate() {
-            if i == idx || !win.is_note() || win.docked != side {
+            if !win.is_note() || win.docked != side || win.dying || win.closing {
                 continue;
             }
-            let mut or = RECT::default();
+            if i != idx && monitor_area_for_window(win.hwnd).handle != area.handle {
+                continue;
+            }
+            let mut r = RECT::default();
             unsafe {
-                let _ = GetWindowRect(win.hwnd, &mut or);
+                let _ = GetWindowRect(win.hwnd, &mut r);
             }
-            let top = win.pos_to.map(|(_, y)| y).unwrap_or(or.top);
-            bands.push((top, top + (or.bottom - or.top)));
+            let desired_y = win.pos_to.map(|(_, y)| y).unwrap_or(r.top);
+            items.push((i, desired_y, r.right - r.left, r.bottom - r.top));
         }
-        bands.sort_unstable();
-        let mut y = r.top;
-        for &(bt, bb) in &bands {
-            if y < bb && y + h > bt {
-                y = bb + sc(DOCK_GAP);
+
+        // Preserve the user's vertical ordering, with the newly dropped note's
+        // actual top deciding where it enters the chain. Then constrain the
+        // ordered chain in both directions: the forward pass pushes downward;
+        // the reverse pass pushes back upward when the chain reaches the bottom.
+        items.sort_by_key(|&(i, y, _, _)| (y, i));
+        let total_h: i32 = items.iter().map(|&(_, _, _, h)| h).sum();
+        let room = (wa.bottom - wa.top - total_h).max(0);
+        let gap = if items.len() > 1 {
+            sc(DOCK_GAP).min(room / (items.len() as i32 - 1))
+        } else {
+            0
+        };
+        let mut ys: Vec<i32> = items
+            .iter()
+            .map(|&(_, desired, _, h)| {
+                desired.clamp(wa.top, (wa.bottom - h).max(wa.top))
+            })
+            .collect();
+
+        for i in 1..items.len() {
+            let prev_bottom = ys[i - 1] + items[i - 1].3;
+            ys[i] = ys[i].max(prev_bottom + gap);
+        }
+        if let Some(last) = items.len().checked_sub(1) {
+            ys[last] = ys[last].min((wa.bottom - items[last].3).max(wa.top));
+            for i in (0..last).rev() {
+                ys[i] = ys[i].min(ys[i + 1] - gap - items[i].3);
+            }
+            if ys[0] < wa.top {
+                ys[0] = wa.top;
+                for i in 1..items.len() {
+                    ys[i] = ys[i].max(ys[i - 1] + items[i - 1].3 + gap);
+                }
             }
         }
-        y = y.clamp(wa.top, (wa.bottom - h).max(wa.top));
-        let win = &mut self.windows[idx];
-        win.docked = side;
-        win.free = true;
-        win.pos_to = Some((Self::dock_x(side, w, DOCK_SLIVER, &wa), y));
+
+        for ((i, _, w, _), y) in items.into_iter().zip(ys) {
+            self.windows[i].dock_ease_x = None;
+            self.windows[i].pos_to = Some((Self::dock_x(side, w, DOCK_SLIVER, &wa), y));
+        }
+        // The vertical pass above settles every hidden sliver on this edge.
+        // Now treat those resolved slivers as fixed obstacles and push any free
+        // notes beside them (and chains of free notes) back into the work area.
+        self.resolve_overlap(idx);
+        self.start_anim_timer();
+        self.mark_dirty();
+    }
+
+    /// Repack one border chain after its revealed note was manually resized,
+    /// without changing any member's reveal X. The resized note keeps its
+    /// current top as the anchor; neighbours pack at the normal dock gap above
+    /// and below it, then the whole chain shifts just enough to remain on-screen.
+    fn reflow_docked_after_resize(&mut self, idx: usize, area: MonitorArea) {
+        if idx >= self.windows.len() || self.windows[idx].docked == 0 {
+            return;
+        }
+        let side = self.windows[idx].docked;
+        let wa = area.work;
+        let mut items: Vec<(usize, i32, i32)> = Vec::new(); // index, desired y, height
+        for (i, win) in self.windows.iter().enumerate() {
+            if !win.is_note() || win.docked != side || win.dying || win.closing {
+                continue;
+            }
+            if i != idx && monitor_area_for_window(win.hwnd).handle != area.handle {
+                continue;
+            }
+            let r = self.rect_of(i);
+            let desired_y = if i == idx {
+                r.top
+            } else {
+                win.pos_to.map(|(_, y)| y).unwrap_or(r.top)
+            };
+            items.push((i, desired_y, r.bottom - r.top));
+        }
+        if items.is_empty() {
+            return;
+        }
+
+        items.sort_by_key(|&(i, y, _)| (y, i));
+        let total_h: i32 = items.iter().map(|&(_, _, h)| h).sum();
+        let room = (wa.bottom - wa.top - total_h).max(0);
+        let gap = if items.len() > 1 {
+            sc(DOCK_GAP).min(room / (items.len() as i32 - 1))
+        } else {
+            0
+        };
+        let anchor = items.iter().position(|&(i, _, _)| i == idx).unwrap_or(0);
+        let mut ys = vec![0i32; items.len()];
+        ys[anchor] = items[anchor]
+            .1
+            .clamp(wa.top, (wa.bottom - items[anchor].2).max(wa.top));
+        for k in (0..anchor).rev() {
+            ys[k] = ys[k + 1] - gap - items[k].2;
+        }
+        for k in (anchor + 1)..items.len() {
+            ys[k] = ys[k - 1] + items[k - 1].2 + gap;
+        }
+        if ys[0] < wa.top {
+            let shift = wa.top - ys[0];
+            for y in &mut ys {
+                *y += shift;
+            }
+        }
+        let last = items.len() - 1;
+        let overflow = ys[last] + items[last].2 - wa.bottom;
+        if overflow > 0 {
+            for y in &mut ys {
+                *y -= overflow;
+            }
+        }
+
+        for ((i, _, _), y) in items.into_iter().zip(ys) {
+            let r = self.rect_of(i);
+            let x = self.windows[i].pos_to.map(|(x, _)| x).unwrap_or(r.left);
+            self.windows[i].pos_to = Some((x, y));
+        }
         self.start_anim_timer();
         self.mark_dirty();
     }
@@ -1127,7 +1603,6 @@ impl App {
         const ITERS: usize = 160;
         let gap = sc(12); // padding kept between notes / from the screen edge
         let half = gap as f32 * 0.5;
-        let wa = work_area();
 
         // Mass-weighted split of a separation between two notes. A note pinned
         // against a wall (in its push direction) can't give, so its partner
@@ -1176,6 +1651,7 @@ impl App {
                 .unwrap_or((r.left as f32, r.top as f32));
             if w.free && w.docked == 0 {
                 let g = gap as f32;
+                let wa = monitor_area_for_window(w.hwnd).work;
                 let minx = wa.left as f32 + g;
                 let maxx = wa.right as f32 - rw - g;
                 let miny = wa.top as f32 + g;
@@ -1300,6 +1776,7 @@ impl App {
         // rect (0 when the cursor is inside the rect).
         let mut nearest: Option<usize> = None;
         let mut best = f32::MAX;
+        let mut direct_note_hover = vec![false; self.windows.len()];
         for i in 0..self.windows.len() {
             // Notes and settings pills both respond to hover; the + does not.
             if !(self.windows[i].is_note() || self.windows[i].is_pill) {
@@ -1308,6 +1785,10 @@ impl App {
             let mut r = RECT::default();
             unsafe {
                 let _ = GetWindowRect(self.windows[i].hwnd, &mut r);
+            }
+            if self.windows[i].is_note() {
+                direct_note_hover[i] =
+                    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
             }
             let dx = (r.left - p.x).max(0).max(p.x - r.right) as f32;
             let dy = (r.top - p.y).max(0).max(p.y - r.bottom) as f32;
@@ -1318,6 +1799,7 @@ impl App {
             }
         }
         let mut wake = false;
+        let drag_idx = self.dragging.as_ref().map(|d| d.idx);
         for i in 0..self.windows.len() {
             if !(self.windows[i].is_note() || self.windows[i].is_pill) {
                 continue;
@@ -1330,6 +1812,17 @@ impl App {
             self.windows[i].active_to = to;
             if self.windows[i].active != to {
                 wake = true;
+            }
+            if self.windows[i].is_note() {
+                let show_header = (direct_note_hover[i]
+                    && !self.windows[i].dock_hover_blocked)
+                    || drag_idx == Some(i)
+                    || self.manual_sizing == Some(i);
+                let header_to = if show_header { 1.0 } else { 0.0 };
+                self.windows[i].header_to = header_to;
+                if self.windows[i].header != header_to {
+                    wake = true;
+                }
             }
         }
         // Idle auto-tuck: if the cursor stays away from the + BUTTON (notes
@@ -1517,7 +2010,9 @@ impl App {
                     && (w.reveal != w.reveal_to
                         || w.glow != w.glow_to
                         || w.active != w.active_to
+                        || w.header != w.header_to
                         || w.pos_to.is_some()
+                        || w.dock_ease_x.is_some()
                         || w.fling.is_some()
                         || w.closing
                         || w.reveal_delay > 0.0))
@@ -1545,16 +2040,55 @@ impl App {
         let k_pos = 1.0 - (-dt / TAU_POS).exp();
         let k_col = 1.0 - (-dt / TAU_COL).exp();
         let mut moves: Vec<(usize, i32, i32)> = Vec::new();
+        let mut header_resizes: Vec<(usize, i32, i32, i32, i32)> = Vec::new();
+        let mut header_redraws: Vec<usize> = Vec::new();
+        let mut collapsed_notes: Vec<usize> = Vec::new();
+        let mut drag_header_delta = 0i32;
         let mut renders: Vec<usize> = Vec::new();
         let mut spins: Vec<usize> = Vec::new();
         // The note under an active manual drag owns its own position; the tween
         // must not move it or it fights the drag and snaps back.
         let drag_idx = self.dragging.as_ref().map(|d| d.idx);
-        for i in 0..self.windows.len() {
-            let mut r = RECT::default();
+        // Capture one coherent frame of geometry. Header changes use this to
+        // move the whole minimum-gap chain above a free or border-hidden note by
+        // the exact same pixel delta, instead of reflowing it after the fact.
+        let mut frame_rects = vec![RECT::default(); self.windows.len()];
+        for (i, r) in frame_rects.iter_mut().enumerate() {
             unsafe {
-                let _ = GetWindowRect(self.windows[i].hwnd, &mut r);
+                let _ = GetWindowRect(self.windows[i].hwnd, r);
             }
+        }
+        // Group 1 is ordinary free notes. Every dock side on every monitor gets
+        // its own group, so a left-edge chain cannot accidentally pull a right-
+        // edge or neighbouring-monitor chain that happens to align vertically.
+        let mut chain_groups = vec![0u32; self.windows.len()];
+        let mut next_dock_group = 2u32;
+        for i in 0..self.windows.len() {
+            let w = &self.windows[i];
+            if !w.is_note() || w.dying || w.closing || drag_idx == Some(i) {
+                continue;
+            }
+            if w.free && w.docked == 0 {
+                chain_groups[i] = 1;
+            } else if w.docked != 0 {
+                let area = monitor_area_for_window(w.hwnd);
+                let matching = (0..i).find(|&j| {
+                    chain_groups[j] >= 2
+                        && self.windows[j].docked == w.docked
+                        && monitor_area_for_window(self.windows[j].hwnd).handle == area.handle
+                });
+                chain_groups[i] = matching
+                    .map(|j| chain_groups[j])
+                    .unwrap_or_else(|| {
+                        let group = next_dock_group;
+                        next_dock_group += 1;
+                        group
+                    });
+            }
+        }
+        let mut chain_dy = vec![0i32; self.windows.len()];
+        for i in 0..self.windows.len() {
+            let mut r = frame_rects[i];
             let w = &mut self.windows[i];
             let mut changed = false;
             // Stack-add hold: the newcomer stays invisible while the others
@@ -1567,13 +2101,18 @@ impl App {
                 }
             }
             let dr = w.reveal_to - w.reveal;
+            let k_reveal = if w.fling.is_some() {
+                1.0 - (-dt / (TAU_FX * FLING_FADE_TIME_SCALE)).exp()
+            } else {
+                k_fx
+            };
             if dr.abs() < 0.004 {
                 if w.reveal != w.reveal_to {
                     w.reveal = w.reveal_to;
                     changed = true;
                 }
             } else {
-                w.reveal += dr * k_fx;
+                w.reveal += dr * k_reveal;
                 changed = true;
             }
             let dg = w.glow_to - w.glow;
@@ -1594,6 +2133,83 @@ impl App {
                 }
             } else {
                 w.active += da * k_fx;
+                changed = true;
+            }
+            // Hover header: ease the expansion fraction, then grow/shrink the
+            // real window only at its TOP edge so the body, text and bottom
+            // edge remain stationary. The text layer is redrawn even on a
+            // sub-pixel step so the 40%-opacity handle fades smoothly.
+            let dh = w.header_to - w.header;
+            if dh.abs() < 0.004 {
+                if w.header != w.header_to {
+                    let old_px = header_px(w.header);
+                    w.header = w.header_to;
+                    if w.header == 0.0 {
+                        collapsed_notes.push(i);
+                    }
+                    let delta = header_px(w.header) - old_px;
+                    if delta != 0 {
+                        if chain_groups[i] != 0 {
+                            for upper in note_chain_above(
+                                i,
+                                &frame_rects,
+                                &chain_groups,
+                                sc(STACK_GAP),
+                            ) {
+                                chain_dy[upper] -= delta;
+                            }
+                        }
+                        if let Some((tx, ty)) = w.pos_to {
+                            w.pos_to = Some((tx, ty - delta));
+                        }
+                        header_resizes.push((
+                            i,
+                            r.left,
+                            r.top - delta,
+                            r.right - r.left,
+                            r.bottom - r.top + delta,
+                        ));
+                        r.top -= delta;
+                        if drag_idx == Some(i) {
+                            drag_header_delta += delta;
+                        }
+                    } else {
+                        header_redraws.push(i);
+                    }
+                    changed = true;
+                }
+            } else {
+                let old_px = header_px(w.header);
+                w.header += dh * k_col;
+                let delta = header_px(w.header) - old_px;
+                if delta != 0 {
+                    if chain_groups[i] != 0 {
+                        for upper in note_chain_above(
+                            i,
+                            &frame_rects,
+                            &chain_groups,
+                            sc(STACK_GAP),
+                        ) {
+                            chain_dy[upper] -= delta;
+                        }
+                    }
+                    if let Some((tx, ty)) = w.pos_to {
+                        w.pos_to = Some((tx, ty - delta));
+                    }
+                    header_resizes.push((
+                        i,
+                        r.left,
+                        r.top - delta,
+                        r.right - r.left,
+                        r.bottom - r.top + delta,
+                    ));
+                    r.top -= delta;
+                    if drag_idx == Some(i) {
+                        drag_header_delta += delta;
+                    }
+                } else {
+                    header_redraws.push(i);
+                }
                 changed = true;
             }
             // Adaptive-colour fade: ease cmix toward the committed scheme.
@@ -1640,21 +2256,41 @@ impl App {
                 }
             } else if let Some((tx, ty)) = w.pos_to {
                 let (dx, dy) = (tx - r.left, ty - r.top);
-                if dx.abs() <= 1 && dy.abs() <= 1 {
-                    w.pos_to = None;
-                    moves.push((i, tx, ty));
+                // Dock reveal/retract uses a stored fractional X coordinate and
+                // the exact same slower exponential factor as the + animation.
+                // This makes even the 5-DIP hover -> 10-DIP click stage visible.
+                let (nx, x_done) = if let Some((fx, target_x)) = w.dock_ease_x {
+                    let next = fx + (target_x - fx) * k_col;
+                    if (target_x - next).abs() < 0.5 {
+                        w.dock_ease_x = None;
+                        (tx, true)
+                    } else {
+                        w.dock_ease_x = Some((next, target_x));
+                        (next.round() as i32, false)
+                    }
+                } else if dx.abs() <= 1 {
+                    (tx, true)
                 } else {
                     let mut nx = r.left + (dx as f32 * k_pos).round() as i32;
-                    let mut ny = r.top + (dy as f32 * k_pos).round() as i32;
-                    // At high frame rates the eased step for the last few px
-                    // rounds to 0, stalling the note short of its slot (uneven
-                    // stack spacing). Force at least 1px of progress each axis.
-                    if nx == r.left && dx != 0 {
+                    if nx == r.left {
                         nx += dx.signum();
                     }
-                    if ny == r.top && dy != 0 {
+                    (nx, false)
+                };
+                let (ny, y_done) = if dy.abs() <= 1 {
+                    (ty, true)
+                } else {
+                    let mut ny = r.top + (dy as f32 * k_pos).round() as i32;
+                    if ny == r.top {
                         ny += dy.signum();
                     }
+                    (ny, false)
+                };
+                if x_done && y_done {
+                    w.pos_to = None;
+                    w.dock_ease_x = None;
+                    moves.push((i, tx, ty));
+                } else {
                     moves.push((i, nx, ny));
                 }
             } else if changed {
@@ -1665,6 +2301,57 @@ impl App {
             if w.closing && w.reveal < 0.02 {
                 w.dying = true;
             }
+        }
+        if drag_header_delta != 0 {
+            if let Some(d) = self.dragging.as_mut() {
+                d.grab_dy += drag_header_delta;
+            }
+        }
+        // Fold the chain translation into whatever operation each upper note
+        // already scheduled this frame. With no other animation, a plain move
+        // keeps its size unchanged. Targets move too, so a concurrent settle
+        // glide cannot pull the note back and cause the old jitter.
+        for (i, &dy) in chain_dy.iter().enumerate() {
+            if dy == 0 {
+                continue;
+            }
+            if let Some((tx, ty)) = self.windows[i].pos_to {
+                self.windows[i].pos_to = Some((tx, ty + dy));
+            }
+            let mut scheduled = false;
+            for resize in &mut header_resizes {
+                if resize.0 == i {
+                    resize.2 += dy;
+                    scheduled = true;
+                }
+            }
+            for movement in &mut moves {
+                if movement.0 == i {
+                    movement.2 += dy;
+                    scheduled = true;
+                }
+            }
+            if !scheduled {
+                moves.push((i, frame_rects[i].left, frame_rects[i].top + dy));
+            }
+        }
+        self.header_resizing = true;
+        for (i, x, y, w, h) in header_resizes {
+            unsafe {
+                let _ = SetWindowPos(
+                    self.windows[i].hwnd,
+                    None,
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+        self.header_resizing = false;
+        for i in header_redraws {
+            self.update_text(i);
         }
         for (i, x, y) in moves {
             unsafe {
@@ -1678,6 +2365,21 @@ impl App {
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE,
                 );
             }
+        }
+        // Stacked notes still use their fixed column relayout. Free and docked
+        // notes were already kept at the resting gap continuously by the live
+        // chain above, so running another settle here would reintroduce jitter.
+        let mut repack_stack = false;
+        for i in collapsed_notes {
+            if i >= self.windows.len() || !self.windows[i].is_note() {
+                continue;
+            }
+            if !self.windows[i].free && self.windows[i].docked == 0 {
+                repack_stack = true;
+            }
+        }
+        if repack_stack {
+            self.relayout_stack(true);
         }
         // Apply the throw-spin rotation to each flinging note's visual.
         for i in spins {
@@ -1738,6 +2440,7 @@ impl App {
         let w = &mut self.windows[idx];
         w.closing = true;
         w.reveal_to = 0.0;
+        w.dock_ease_x = None;
         w.pos_to = Some((r.left, r.top - 34));
         self.start_anim_timer();
     }
@@ -1800,13 +2503,14 @@ impl App {
     /// undo history's delete entry.
     fn capture_note_data(&self, idx: usize, r: RECT) -> NoteData {
         let win = &self.windows[idx];
+        let hp = header_px(win.header);
         NoteData {
             id: win.id,
             text: self.note_html(idx),
             x: r.left,
-            y: r.top,
+            y: r.top + hp,
             w: r.right - r.left,
-            h: r.bottom - r.top,
+            h: (r.bottom - r.top - hp).max(1),
             free: win.free,
             docked: win.docked,
             color: win.color,
@@ -1887,7 +2591,8 @@ impl App {
         if n.docked != 0 {
             // Docked to a corner: re-dock to the same side. dock_note recomputes
             // the sliver x and stacks it below the other notes docked there.
-            self.dock_note(i, n.docked);
+            let area = monitor_area_for_window(self.windows[i].hwnd);
+            self.dock_note(i, n.docked, area);
         } else if !n.free {
             // In the stack: slot it back at its old rank, then repack the column.
             self.windows[i].free = false;
@@ -2105,7 +2810,9 @@ impl App {
     fn hit_test_char(&self, i: usize, x: f32, y: f32) -> usize {
         let w = &self.windows[i];
         let s: String = w.text.iter().collect();
-        let target = self.renderer.hit_test_text(&w.surface, &s, w.font_size, x, y);
+        let target = self
+            .renderer
+            .hit_test_text(&w.surface, &s, w.font_size, x, y, w.header);
         // Walk the UTF-16 offset back to a char index (clamped to a char
         // boundary — a mid-surrogate hit rounds up past the char).
         let mut acc = 0u32;
@@ -2125,11 +2832,16 @@ impl App {
         let w = &self.windows[i];
         let s: String = w.text.iter().collect();
         let cu = chars_to_u16(&w.text, w.caret);
-        let Some((x, y, lh)) = self.renderer.caret_point(&w.surface, &s, w.font_size, cu) else {
+        let Some((x, y, lh)) = self
+            .renderer
+            .caret_point(&w.surface, &s, w.font_size, cu, w.header)
+        else {
             return w.caret;
         };
         let ty = if down { y + lh * 1.5 } else { y - lh * 0.5 };
-        let u = self.renderer.hit_test_text(&w.surface, &s, w.font_size, x, ty);
+        let u = self
+            .renderer
+            .hit_test_text(&w.surface, &s, w.font_size, x, ty, w.header);
         u16_to_chars(&w.text, u)
     }
 
@@ -2139,12 +2851,19 @@ impl App {
         let w = &self.windows[i];
         let s: String = w.text.iter().collect();
         let cu = chars_to_u16(&w.text, w.caret);
-        let Some((_x, y, lh)) = self.renderer.caret_point(&w.surface, &s, w.font_size, cu) else {
+        let Some((_x, y, lh)) = self
+            .renderer
+            .caret_point(&w.surface, &s, w.font_size, cu, w.header)
+        else {
             return (0, w.text.len());
         };
         let midy = y + lh * 0.5;
-        let a = self.renderer.hit_test_text(&w.surface, &s, w.font_size, 0.0, midy);
-        let b = self.renderer.hit_test_text(&w.surface, &s, w.font_size, 1.0e6, midy);
+        let a = self
+            .renderer
+            .hit_test_text(&w.surface, &s, w.font_size, 0.0, midy, w.header);
+        let b = self
+            .renderer
+            .hit_test_text(&w.surface, &s, w.font_size, 1.0e6, midy, w.header);
         (u16_to_chars(&w.text, a), u16_to_chars(&w.text, b))
     }
 
@@ -2229,13 +2948,18 @@ impl App {
             unsafe {
                 let _ = GetWindowRect(w.hwnd, &mut r);
             }
+            // Persist a resolved animation destination rather than a temporary
+            // mid-glide position. In particular this prevents a quick save/quit
+            // from resurrecting a dock overlap on the next launch.
+            let (x, y) = w.pos_to.unwrap_or((r.left, r.top));
+            let hp = header_px(w.header);
             notes.push(NoteData {
                 id: w.id,
                 text: self.note_html(i),
-                x: r.left,
-                y: r.top,
+                x,
+                y: y + hp,
                 w: r.right - r.left,
-                h: r.bottom - r.top,
+                h: (r.bottom - r.top - hp).max(1),
                 free: w.free,
                 docked: w.docked,
                 color: w.color,
@@ -2243,12 +2967,13 @@ impl App {
             });
         }
         Store {
-            version: 1,
+            version: 3,
             next_id: self.next_id,
             user_scale: self.user_scale,
             // The note pixels above are at the current effective scale; record
             // it so a later load on a different-DPI display can rescale them.
             layout_scale: ui_scale(),
+            slide_out_hidden_notes: self.slide_out_hidden_notes,
             notes,
         }
     }
@@ -2405,6 +3130,13 @@ impl App {
             self.windows[i].active,
             self.windows[i].cmix,
         );
+        // Destructive action stays in the existing pill system, with only a
+        // restrained adaptive red wash distinguishing it from other settings.
+        let danger_tint = if self.windows[i].is_pill && self.windows[i].pill_kind == 0 {
+            0.72
+        } else {
+            0.0
+        };
         // Menu pills are the same liquid glass as notes (the shader clamps
         // corner_radius to half the height, so a 40 px pill auto-rounds to a
         // full capsule); their labels are white coverage the shader inks.
@@ -2434,6 +3166,7 @@ impl App {
             glow,
             active,
             cmix,
+            danger_tint,
         );
     }
 
@@ -2471,6 +3204,7 @@ impl App {
             show,
             w.font_size,
             sel,
+            w.header,
         );
         self.render_one(i);
     }
@@ -2490,13 +3224,15 @@ impl App {
         }
         let (w, cur_h) = (r.right - r.left, r.bottom - r.top);
         let pad = scf(PAD) as i32;
+        let header = header_px(self.windows[i].header);
         let content_w = (w - 2 * pad).max(1) as f32;
         let s: String = self.windows[i].text.iter().collect();
         let text_h = self
             .renderer
             .measure_text(&s, content_w, self.windows[i].font_size);
-        let desired =
-            (text_h.ceil() as i32 + 2 * pad).max(sc(NOTE_MIN_H).max(self.windows[i].manual_h));
+        let desired = (text_h.ceil() as i32 + 2 * pad)
+            .max(sc(NOTE_MIN_H).max(self.windows[i].manual_h))
+            + header;
         // Only move when the height really differs — the resulting
         // WM_WINDOWPOSCHANGED re-enters our layout code.
         if (desired - cur_h).abs() > 1 {
@@ -2569,6 +3305,7 @@ impl App {
             // rest of the stack reflows live under the resize grip — but not
             // during a bulk rescale, which relays everything out once at the end.
             if !self.rescaling
+                && !self.header_resizing
                 && self.windows[i].is_note()
                 && !self.windows[i].free
                 && self.windows[i].docked == 0
@@ -2636,9 +3373,9 @@ impl App {
         }
     }
 
-    /// Right-click on [+]: fan the pill menu out to the button's left — a
-    /// Quit pill and a launch-on-startup toggle pill, both popping from
-    /// behind the ➕ with a small stagger. A fullscreen invisible catcher is
+    /// Right-click on [+]: fan the existing settings pills out beside the
+    /// button, each popping from behind the ➕ with a small stagger. A
+    /// fullscreen invisible catcher is
     /// created first (so it sits UNDER the pills in z) to dismiss the menu
     /// on any outside click. Right-click again toggles the menu shut.
     fn open_pill_menu(&mut self) {
@@ -2692,18 +3429,31 @@ impl App {
         // sliding left, then fades in (staggered) — so the two never overlap.
         const SLIDE_DELAY: f32 = 0.26;
         let startup_on = startup_enabled();
-        // Quit, Launch-on-startup, Opacity, then Size on top.
-        let specs: [(u8, f32); 4] = [(0, 0.0), (1, 0.05), (2, 0.10), (3, 0.15)];
+        let slide_hidden_on = self.slide_out_hidden_notes;
+        // Quit, Launch-on-startup, Slide-out-hidden, Opacity, then Size on top.
+        let specs: [(u8, f32); 5] = [
+            (0, 0.0),
+            (1, 0.05),
+            (4, 0.10),
+            (2, 0.15),
+            (3, 0.20),
+        ];
         let mut slot_y = br.bottom;
         for &(kind, stagger) in &specs {
-            slot_y -= sc(NOTE_H);
+            slot_y -= sc(PILL_H);
             let ty = slot_y;
-            if self.create_window(sx, ty, sc(NOTE_W), sc(NOTE_H), false, 0).is_ok() {
+            if self.create_window(sx, ty, sc(NOTE_W), sc(PILL_H), false, 0).is_ok() {
                 let i = self.windows.len() - 1;
                 let w = &mut self.windows[i];
                 w.is_pill = true;
                 w.pill_kind = kind;
-                w.pill_on = kind == 1 && startup_on;
+                w.pill_on = if kind == 1 {
+                    startup_on
+                } else if kind == 4 {
+                    slide_hidden_on
+                } else {
+                    false
+                };
                 w.reveal = 0.0;
                 w.reveal_to = 0.0;
                 w.reveal_delay = SLIDE_DELAY + stagger;
@@ -2730,7 +3480,7 @@ impl App {
         // current position.
         let wa = work_area();
         let sx = (wa.right - sc(24)) - sc(NOTE_W);
-        let bottom_slot = (wa.bottom - sc(24)) - sc(NOTE_H);
+        let bottom_slot = (wa.bottom - sc(24)) - sc(PILL_H);
         for i in 0..self.windows.len() {
             if !self.windows[i].is_pill || self.windows[i].dying {
                 continue;
@@ -2776,6 +3526,7 @@ impl App {
                 };
                 self.renderer.draw_size(&w.surface, frac)
             }
+            4 => self.renderer.draw_slide_hidden(&w.surface, w.pill_on),
             _ => self.renderer.draw_startup(&w.surface, w.pill_on),
         };
         self.render_one(i);
@@ -2793,6 +3544,30 @@ impl App {
                 self.render_one(i);
             }
         }
+    }
+
+    fn set_slide_out_hidden_notes(&mut self, on: bool) {
+        self.slide_out_hidden_notes = on;
+        if !on {
+            // Turning the feature off immediately restores every docked note to
+            // the normal sliver state; subsequent hover uses the old small peek.
+            let docked: Vec<usize> = self
+                .windows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, w)| (w.is_note() && w.docked != 0).then_some(i))
+                .collect();
+            for i in docked {
+                self.slide_docked_to(i, DOCK_SLIVER, 0.0);
+            }
+        }
+        for i in 0..self.windows.len() {
+            if self.windows[i].is_pill && self.windows[i].pill_kind == 4 {
+                self.windows[i].pill_on = on;
+                self.draw_pill(i);
+            }
+        }
+        self.mark_dirty();
     }
 
     /// Set the manual size multiplier from a 0..4 slider level, live-rescale the
@@ -2849,6 +3624,7 @@ impl App {
                 self.windows[i].manual_h =
                     (self.windows[i].manual_h as f32 * ratio).round() as i32;
                 self.windows[i].pos_to = None;
+                self.windows[i].dock_ease_x = None;
             }
             unsafe {
                 // Synchronously drives WM_WINDOWPOSCHANGED -> on_moved_or_resized,
@@ -2898,9 +3674,10 @@ impl App {
             if !self.windows[i].is_pill || self.windows[i].dying || self.windows[i].closing {
                 continue;
             }
-            slot_y -= sc(NOTE_H);
+            slot_y -= sc(PILL_H);
             let ty = slot_y;
             self.windows[i].pos_to = None;
+            self.windows[i].dock_ease_x = None;
             unsafe {
                 let _ = SetWindowPos(
                     self.windows[i].hwnd,
@@ -2908,7 +3685,7 @@ impl App {
                     sx,
                     ty,
                     sc(NOTE_W),
-                    sc(NOTE_H),
+                    sc(PILL_H),
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
@@ -3134,9 +3911,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if no_resize {
                 return LRESULT(HTCLIENT as isize);
             }
-            // A docked sliver is peek/click-to-restore only: no resize
-            // borders, so the whole visible strip is client area.
-            if idx.map(|i| app.windows[i].docked != 0).unwrap_or(false) {
+            // Protect the narrow resting sliver from accidental resize. With
+            // slide-out enabled, its normal resize edges become available as
+            // soon as that particular hidden note is actively popping out.
+            if let Some(i) = idx {
+                if app.windows[i].docked != 0 {
+                    let popped_for_resize = app.slide_out_hidden_notes
+                        && !app.windows[i].dock_hover_blocked
+                        && (app.windows[i].header > 0.01
+                            || app.windows[i].header_to > 0.0
+                            || app.focused == Some(i)
+                            || app.manual_sizing == Some(i));
+                    if !popped_for_resize {
+                        return LRESULT(HTCLIENT as isize);
+                    }
+                }
+            }
+            // The whole added header is a forgiving drag target, including
+            // its far-left/far-right ends. Resize hit zones begin below it.
+            let handle_h = idx.map(|i| header_px(app.windows[i].header)).unwrap_or(0);
+            if handle_h > 0 && y < r.top + handle_h {
                 return LRESULT(HTCLIENT as isize);
             }
             let b = RESIZE_BORDER;
@@ -3164,9 +3958,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let mmi = lparam.0 as *mut MINMAXINFO;
             if !mmi.is_null() {
                 unsafe {
+                    let header = app
+                        .index_of(hwnd)
+                        .filter(|&i| app.windows[i].is_note())
+                        .map(|i| header_px(app.windows[i].header))
+                        .unwrap_or(0);
                     (*mmi).ptMinTrackSize = POINT {
                         x: sc(NOTE_MIN_W),
-                        y: sc(NOTE_MIN_H),
+                        y: sc(NOTE_MIN_H) + header,
                     };
                     (*mmi).ptMaxTrackSize = POINT {
                         x: sc(NOTE_MAX_W),
@@ -3188,12 +3987,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if !rp.is_null() {
                         let rc = unsafe { &mut *rp };
                         let pad = scf(PAD) as i32;
+                        let header = header_px(app.windows[i].header);
                         let content_w = ((rc.right - rc.left) - 2 * pad).max(1) as f32;
                         let s: String = app.windows[i].text.iter().collect();
                         let text_h =
                             app.renderer
                                 .measure_text(&s, content_w, app.windows[i].font_size);
-                        let need = (text_h.ceil() as i32 + 2 * pad).max(sc(NOTE_MIN_H));
+                        let need =
+                            (text_h.ceil() as i32 + 2 * pad).max(sc(NOTE_MIN_H)) + header;
                         if rc.bottom - rc.top < need {
                             // Grow from whichever horizontal edge isn't being
                             // dragged: 3/4/5 = TOP / TOPLEFT / TOPRIGHT.
@@ -3211,6 +4012,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_ENTERSIZEMOVE => {
+            if let Some(i) = app.index_of(hwnd) {
+                if app.windows[i].is_note() && app.windows[i].docked != 0 {
+                    app.manual_sizing = Some(i);
+                    // The OS resize loop owns geometry until WM_EXITSIZEMOVE;
+                    // stop the reveal tween from pulling against the resize grip.
+                    app.windows[i].pos_to = None;
+                    app.windows[i].dock_ease_x = None;
+                    app.windows[i].header_to = 1.0;
+                    app.start_anim_timer();
+                }
+            }
             unsafe {
                 let _ = SetTimer(Some(hwnd), TIMER_MODAL, 10, None);
             }
@@ -3222,13 +4034,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             // The user just resized this note by hand: remember the height as
             // a floor so auto-height never shrinks it back below their pick.
+            let mut resized_dock = None;
             if let Some(i) = app.index_of(hwnd) {
                 if app.windows[i].is_note() {
                     let mut r = RECT::default();
                     unsafe {
                         let _ = GetWindowRect(hwnd, &mut r);
                     }
-                    app.windows[i].manual_h = r.bottom - r.top;
+                    app.windows[i].manual_h =
+                        (r.bottom - r.top - header_px(app.windows[i].header)).max(1);
+                    if app.windows[i].docked != 0 {
+                        resized_dock = Some((i, monitor_area_for_window(hwnd)));
+                    }
+                }
+            }
+            app.manual_sizing = None;
+            if let Some((i, area)) = resized_dock {
+                app.reflow_docked_after_resize(i, area);
+                if app.slide_out_hidden_notes {
+                    let inset = if app.focused == Some(i) {
+                        DOCK_CLICK_INSET_DIP
+                    } else {
+                        DOCK_HOVER_INSET_DIP
+                    };
+                    app.slide_docked_to(i, 1.0, inset);
                 }
             }
             app.pump(true);
@@ -3272,8 +4101,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_LBUTTONDOWN => {
-            // Top drag strip of a note: start a manual drag (no focus, no
-            // edit). Below the strip: take keyboard focus and edit.
+            // Dedicated top handle: start a manual drag (no focus, no edit).
+            // Below the handle: take keyboard focus and edit.
             if let Some(i) = app.index_of(hwnd) {
                 // A Quit/toggle pill acts on button-up (press is a no-op). An
                 // Opacity/Size slider starts a drag: the knob follows the cursor
@@ -3297,30 +4126,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let _ = GetCursorPos(&mut p);
                         let _ = GetWindowRect(hwnd, &mut r);
                     }
-                    // Docked sliver: one click undocks — slide the note fully
-                    // back on-screen (no drag, no edit).
+                    // Docked sliver. With the new setting enabled, keep its dock
+                    // identity, nudge the fully revealed note 5 DIPs inward,
+                    // and continue into normal edit/drag handling below. With
+                    // the setting off, preserve the old one-click-undock path.
                     if app.windows[i].docked != 0 {
-                        let wa = work_area();
-                        let w = r.right - r.left;
-                        let hi = (wa.right - w - 8).max(wa.left + 8);
-                        let x = r.left.clamp(wa.left + 8, hi);
-                        app.windows[i].docked = 0;
-                        app.windows[i].pos_to = Some((x, r.top));
-                        app.start_anim_timer();
-                        app.mark_dirty();
-                        return LRESULT(0);
+                        if app.slide_out_hidden_notes {
+                            // A deliberate click is allowed to bypass the
+                            // just-docked hover guard and open for editing.
+                            app.windows[i].dock_hover_blocked = false;
+                            app.slide_docked_to(i, 1.0, DOCK_CLICK_INSET_DIP);
+                        } else {
+                            let wa = monitor_area_for_window(hwnd).work;
+                            let w = r.right - r.left;
+                            let hi = (wa.right - w - 8).max(wa.left + 8);
+                            let x = r.left.clamp(wa.left + 8, hi);
+                            let y = app.windows[i].pos_to.map(|(_, y)| y).unwrap_or(r.top);
+                            app.windows[i].docked = 0;
+                            app.windows[i].dock_hover_blocked = false;
+                            app.windows[i].dock_ease_x = None;
+                            app.windows[i].pos_to = Some((x, y));
+                            app.start_anim_timer();
+                            app.mark_dirty();
+                            return LRESULT(0);
+                        }
                     }
-                    // Top-right [×] hit zone (inside the drag strip, checked
-                    // first): animated close instead of a drag or edit.
-                    if p.x >= r.right - 30
-                        && p.x <= r.right - 6
-                        && p.y >= r.top + 6
-                        && p.y <= r.top + 30
-                    {
-                        app.close_note(i);
-                        return LRESULT(0);
-                    }
-                    if p.y < r.top + DRAG_STRIP {
+                    // The new header is drag-only across its full width. Note
+                    // deletion remains an intentional flick or Ctrl+W; there
+                    // is no invisible close target at the right edge anymore.
+                    let handle_h = header_px(app.windows[i].header);
+                    if handle_h > 0 && p.y < r.top + handle_h {
                         unsafe {
                             let _ = SetCapture(hwnd);
                         }
@@ -3328,6 +4163,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             idx: i,
                             grab_dx: p.x - r.left,
                             grab_dy: p.y - r.top,
+                            start_pos: p,
                             moved: false,
                             last_pos: p,
                             last_t: unsafe { GetMessageTime() } as u32,
@@ -3442,15 +4278,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if let Some(i) = app.index_of(hwnd) {
                     let side = app.windows[i].docked;
                     if side != 0 {
-                        let mut r = RECT::default();
-                        unsafe {
-                            let _ = GetWindowRect(hwnd, &mut r);
-                        }
-                        let wa = work_area();
-                        let tx = App::dock_x(side, r.right - r.left, DOCK_PEEK, &wa);
-                        if app.windows[i].pos_to != Some((tx, r.top)) {
-                            app.windows[i].pos_to = Some((tx, r.top));
-                            app.start_anim_timer();
+                        if !app.windows[i].dock_hover_blocked {
+                            if app.slide_out_hidden_notes {
+                                let inset = if app.focused == Some(i) {
+                                    DOCK_CLICK_INSET_DIP
+                                } else {
+                                    DOCK_HOVER_INSET_DIP
+                                };
+                                app.slide_docked_to(i, 1.0, inset);
+                            } else {
+                                app.slide_docked_to(i, DOCK_PEEK, 0.0);
+                            }
                         }
                         if !app.windows[i].tracking {
                             app.windows[i].tracking = true;
@@ -3483,6 +4321,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             if !d.moved && (p.x - d.last_pos.x).abs() + (p.y - d.last_pos.y).abs() > 4 {
                 d.moved = true;
+                if app.windows[d.idx].docked != 0 {
+                    // Actual movement (not merely clicking/editing) permanently
+                    // detaches a slide-out note from the border. From here the
+                    // normal free-note drag/drop paths own it.
+                    app.windows[d.idx].docked = 0;
+                    app.windows[d.idx].tracking = false;
+                    app.windows[d.idx].dock_hover_blocked = false;
+                }
                 if !app.windows[d.idx].free {
                     // Detach: the note leaves the stack; the remaining
                     // stacked notes animate closed over the gap it left.
@@ -3492,6 +4338,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 // Drop any pending glide (stack/dock/spawn) so the tween can't
                 // pull the note back while the hand is dragging it.
                 app.windows[d.idx].pos_to = None;
+                app.windows[d.idx].dock_ease_x = None;
             }
             if d.moved {
                 unsafe {
@@ -3511,9 +4358,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 d.vy = 0.6 * d.vy + 0.4 * ((p.y - d.last_pos.y) as f32 * 1000.0 / dt);
                 d.last_pos = p;
                 d.last_t = now;
-                // Snap-glow while overlapping the stack column.
+                // The same blue snap-glow previews either destination. Border
+                // docking has priority when both the edge zone and stack overlap.
                 if app.windows[d.idx].free {
-                    let target = if app.over_stack(d.idx) { 1.0 } else { 0.0 };
+                    let dock_ready = app.dock_side_for_drop(d.idx, p).is_some();
+                    let target = if dock_ready || app.over_stack(d.idx) {
+                        1.0
+                    } else {
+                        0.0
+                    };
                     if app.windows[d.idx].glow_to != target {
                         app.windows[d.idx].glow_to = target;
                         app.start_anim_timer();
@@ -3527,16 +4380,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             // Cursor left a docked sliver: end the peek, back to the sliver.
             if let Some(i) = app.index_of(hwnd) {
                 app.windows[i].tracking = false;
+                // A newly docked note becomes hoverable only after this first
+                // genuine departure; a later re-entry may reveal it normally.
+                app.windows[i].dock_hover_blocked = false;
                 let side = app.windows[i].docked;
                 if side != 0 {
-                    let mut r = RECT::default();
-                    unsafe {
-                        let _ = GetWindowRect(hwnd, &mut r);
+                    let editing = app.slide_out_hidden_notes && app.focused == Some(i);
+                    if !editing {
+                        app.slide_docked_to(i, DOCK_SLIVER, 0.0);
                     }
-                    let wa = work_area();
-                    let tx = App::dock_x(side, r.right - r.left, DOCK_SLIVER, &wa);
-                    app.windows[i].pos_to = Some((tx, r.top));
-                    app.start_anim_timer();
                 }
             }
             LRESULT(0)
@@ -3572,7 +4424,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // note off-screen along the throw vector, fading as it
                     // flies; anim_tick advances it and reap_dying trashes it.
                     let speed = (d.vx * d.vx + d.vy * d.vy).sqrt();
-                    if speed > 2000.0 {
+                    let travel_x = (p.x - d.start_pos.x) as f32;
+                    let travel_y = (p.y - d.start_pos.y) as f32;
+                    let travel = (travel_x * travel_x + travel_y * travel_y).sqrt();
+                    if speed > FLING_DELETE_SPEED
+                        && travel >= scf(FLING_DELETE_TRAVEL_DIP)
+                    {
                         // Record the delete for undo now, while the note is
                         // still at its on-screen spot (before it flies off), so
                         // Ctrl+Z brings it back where it was.
@@ -3588,12 +4445,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let hpx = (rr.bottom - rr.top) as f32;
                         let rgx = d.grab_dx as f32 - wpx * 0.5;
                         let rgy = d.grab_dy as f32 - hpx * 0.5;
-                        let torque = rgx * d.vy - rgy * d.vx;
+                        let (fling, spin) = fling_motion(d.vx, d.vy, rgx, rgy);
                         let w = &mut app.windows[d.idx];
-                        w.fling = Some((d.vx, d.vy));
-                        // Livelier tumble: stronger torque coupling and a higher
-                        // cap so a hard flick really whips around.
-                        w.spin = (torque * 0.0020).clamp(-1440.0, 1440.0);
+                        w.fling = Some(fling);
+                        w.spin = spin;
                         w.angle = 0.0;
                         w.reveal_to = 0.0;
                         w.glow_to = 0.0;
@@ -3601,7 +4456,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         return LRESULT(0);
                     }
                     if d.moved && app.windows[d.idx].free {
-                        if app.over_stack(d.idx) {
+                        // Border docking wins over the stack when both snap
+                        // regions are active, matching the blue preview.
+                        let dock_target = app.dock_side_for_drop(d.idx, p);
+                        if let Some((dock_side, area)) = dock_target {
+                            app.dock_note(d.idx, dock_side, area);
+                            // The cursor is necessarily still over/near the
+                            // edge after release. Suppress that residual hover
+                            // until this note receives WM_MOUSELEAVE once.
+                            app.windows[d.idx].dock_hover_blocked =
+                                app.slide_out_hidden_notes;
+                        } else if app.over_stack(d.idx) {
                             // Snap into the stack: set the top to the cursor y
                             // so stacked_indices sorts it into place by height,
                             // then animate the whole column (newcomer included).
@@ -3622,19 +4487,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                             app.relayout_stack(true);
                         } else {
-                            // Dropped near a work-area edge: dock as a sliver;
-                            // anywhere else stays plain free (and undocked).
-                            let wa = work_area();
-                            if p.x <= wa.left + sc(DOCK_TRIGGER) {
-                                app.dock_note(d.idx, -1);
-                            } else if p.x >= wa.right - sc(DOCK_TRIGGER) {
-                                app.dock_note(d.idx, 1);
-                            } else {
-                                // Stays plain free: repel it out of any overlap
-                                // with other notes so nothing overlaps at rest.
-                                app.windows[d.idx].docked = 0;
-                                app.resolve_overlap(d.idx);
-                            }
+                            // Stays plain free: repel it out of any overlap with
+                            // other notes so nothing overlaps at rest.
+                            app.windows[d.idx].docked = 0;
+                            app.resolve_overlap(d.idx);
                         }
                     }
                     app.windows[d.idx].glow_to = 0.0;
@@ -3707,7 +4563,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 (((p.x - r.left) as f32 - tl) / (tr - tl)).clamp(0.0, 1.0);
                             app.set_size_level((frac * 4.0).round() as u8);
                         }
-                        _ => {
+                        4 => {
+                            let on = !app.slide_out_hidden_notes;
+                            app.set_slide_out_hidden_notes(on);
+                        }
+                        1 => {
                             // Startup toggle: flip the Run entry and redraw so
                             // the knob slides; the menu stays open to show it.
                             let on = !app.windows[i].pill_on;
@@ -3715,6 +4575,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             app.windows[i].pill_on = on;
                             app.draw_pill(i);
                         }
+                        _ => {}
                     }
                 }
             }
@@ -3725,6 +4586,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if app.windows[i].is_note() {
                     app.focused = Some(i);
                     app.caret_on = true;
+                    if app.slide_out_hidden_notes && app.windows[i].docked != 0 {
+                        app.slide_docked_to(i, 1.0, DOCK_CLICK_INSET_DIP);
+                    }
                     unsafe {
                         let _ = SetTimer(Some(hwnd), TIMER_CARET, 530, None);
                     }
@@ -3740,6 +4604,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 if app.focused == Some(i) {
                     app.focused = None;
+                }
+                if app.slide_out_hidden_notes && app.windows[i].docked != 0 {
+                    // Editing ended without a drag-away: ease the note back to
+                    // its hidden sliver while preserving its dock assignment.
+                    app.slide_docked_to(i, DOCK_SLIVER, 0.0);
                 }
                 // Clicking away deselects: drop the selection so nothing stays
                 // highlighted once the note is no longer active (unless a mouse
