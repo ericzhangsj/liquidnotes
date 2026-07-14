@@ -21,6 +21,7 @@ use liquidnotes::text::{
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
@@ -69,9 +70,32 @@ const NOTE_MIN_W: i32 = 170;
 const NOTE_MIN_H: i32 = NOTE_H;
 const NOTE_MAX_W: i32 = 760;
 const STACK_GAP: i32 = 12;
+/// Invisible grab halo around the small visible handle pill. The full expanded
+/// header remains draggable; this additionally reaches into the empty top text
+/// padding so the cursor only needs to be near the pill, not precisely on it.
+const HANDLE_GRAB_W_DIP: f32 = 160.0;
+const HANDLE_GRAB_BELOW_DIP: f32 = 14.0;
 
 fn header_px(frac: f32) -> i32 {
     (scf(NOTE_HEADER) * frac.clamp(0.0, 1.0)).round() as i32
+}
+
+fn handle_drag_hit(header_frac: f32, local_x: i32, local_y: i32, width: i32) -> bool {
+    let header = header_px(header_frac);
+    if header <= 0 || local_x < 0 || local_y < 0 || local_x >= width {
+        return false;
+    }
+    // Preserve the original forgiving full-width header target.
+    if local_y < header {
+        return true;
+    }
+
+    let edge_guard = RESIZE_BORDER.max(1);
+    let usable_w = (width - 2 * edge_guard).max(0);
+    let halo_w = (scf(HANDLE_GRAB_W_DIP).round() as i32).min(usable_w);
+    let halo_left = (width - halo_w) / 2;
+    let halo_bottom = header + scf(HANDLE_GRAB_BELOW_DIP).round() as i32;
+    local_y < halo_bottom && local_x >= halo_left && local_x < halo_left + halo_w
 }
 
 /// Notes separated by the resting gap behave like a vertical chain. Starting at
@@ -316,14 +340,20 @@ struct Drag {
     /// Last cursor position/time, for velocity tracking.
     last_pos: POINT,
     last_t: u32,
-    /// Smoothed cursor velocity in px/s (for the later flick gesture).
+    /// Smoothed cursor velocity in DIPs/s (for device-independent flick intent).
     vx: f32,
     vy: f32,
 }
 
-/// A release must exceed this speed to become a flick-to-delete.
-const FLING_DELETE_SPEED: f32 = 2000.0;
+/// A release must exceed this device-independent speed to become a delete flick.
+const FLING_DELETE_SPEED_DIP: f32 = 2000.0;
 const FLING_DELETE_TRAVEL_DIP: f32 = 110.0;
+/// Mouse timestamps have only millisecond resolution. Samples shorter than this
+/// are accumulated instead of turning a few pixels into a huge false velocity.
+const FLING_SAMPLE_MIN_MS: u32 = 8;
+/// A real throw releases immediately after its last fast movement. Once this
+/// much time passes, a stored velocity is stale and cannot delete the note.
+const FLING_RELEASE_MAX_AGE_MS: u32 = 80;
 /// Clamp pathological mouse samples so a note never teleports off-screen in a
 /// single frame. Direction is preserved by scaling both velocity components.
 const FLING_MAX_SPEED: f32 = 4200.0;
@@ -333,7 +363,37 @@ const FLING_MAX_SPIN: f32 = 1440.0;
 /// Thrown notes fade for twice as long as ordinary reveal/close transitions.
 const FLING_FADE_TIME_SCALE: f32 = 2.0;
 
-/// Convert the measured drag velocity and grab offset into bounded linear and
+/// Turn one sufficiently long physical-pixel sample into a DPI-independent
+/// smoothed velocity. Returning `None` leaves the anchor untouched so several
+/// high-polling sub-samples accumulate into one trustworthy time window.
+fn smooth_drag_velocity(
+    old_vx: f32,
+    old_vy: f32,
+    dx_px: i32,
+    dy_px: i32,
+    elapsed_ms: u32,
+    dpi: u32,
+) -> Option<(f32, f32)> {
+    if elapsed_ms < FLING_SAMPLE_MIN_MS {
+        return None;
+    }
+    let px_to_dip = 96.0 / dpi.max(1) as f32;
+    let per_second = 1000.0 / elapsed_ms as f32;
+    let sample_vx = dx_px as f32 * px_to_dip * per_second;
+    let sample_vy = dy_px as f32 * px_to_dip * per_second;
+    Some((
+        0.6 * old_vx + 0.4 * sample_vx,
+        0.6 * old_vy + 0.4 * sample_vy,
+    ))
+}
+
+fn fling_delete_ready(speed_dip: f32, travel_px: f32, dpi: u32, age_ms: u32) -> bool {
+    speed_dip > FLING_DELETE_SPEED_DIP
+        && travel_px >= dip_to_monitor_px(FLING_DELETE_TRAVEL_DIP, dpi) as f32
+        && age_ms <= FLING_RELEASE_MAX_AGE_MS
+}
+
+/// Convert physical-pixel drag velocity and grab offset into bounded linear and
 /// angular fling motion. Real grab-offset torque chooses the rotation direction
 /// whenever it is meaningful; otherwise the throw direction supplies a stable
 /// fallback, so every deleted note rotates.
@@ -732,8 +792,9 @@ fn main() -> Result<()> {
 
         // Poll capture on a high-resolution waitable timer instead of a plain
         // millisecond timeout: the default system timer granularity is ~15 ms,
-        // which alone adds ~1 frame of lag to the backdrop when idle. A
-        // high-res timer wakes us every ~3 ms regardless of that granularity.
+        // which alone adds ~1 frame of lag to the backdrop when idle. The timer
+        // finds new work promptly; DwmFlush below paces completed visual batches
+        // to the display instead of flooding a slower compositor at ~300 Hz.
         let timer = CreateWaitableTimerExW(
             None,
             PCWSTR::null(),
@@ -779,9 +840,9 @@ fn main() -> Result<()> {
                 DispatchMessageW(&msg);
             }
             app.pump(false);
-            // Animations ride the same ~3 ms wake as the backdrop: a QPC
-            // delta-time step (frame-rate independent, up to ~300 fps, paced
-            // only by render cost) instead of the old coarse 16 ms WM_TIMER.
+            // Animations use a QPC delta-time step, so their duration stays
+            // stable at 60/120/180 Hz. DWM pacing below decides presentation
+            // cadence instead of a fixed timer guessing the monitor refresh.
             let mut now = 0i64;
             let _ = QueryPerformanceCounter(&mut now);
             if app.any_animating() {
@@ -795,6 +856,12 @@ fn main() -> Result<()> {
                 app.anim_prev_qpc = now;
             }
             app.reap_dying();
+            // All composition swapchains use Present(0) so multiple notes can
+            // submit without blocking one-by-one. Flush once after the batch:
+            // this applies compositor back-pressure at the monitor cadence,
+            // eliminating the uneven queued frames visible on 60 Hz/iGPU/high-
+            // DPI laptops while retaining the native high refresh on desktops.
+            let _ = DwmFlush();
         }
         app.save_all();
         // Quit with the menu open (tray Quit, etc.): free the catcher too.
@@ -1039,6 +1106,48 @@ mod fling_tests {
     fn extreme_torque_is_capped() {
         let (_, spin) = fling_motion(4000.0, 4000.0, 1000.0, -1000.0);
         assert_eq!(spin, FLING_MAX_SPIN);
+    }
+
+    #[test]
+    fn tiny_timestamp_samples_are_accumulated_not_spiked() {
+        assert_eq!(smooth_drag_velocity(0.0, 0.0, 5, 0, 1, 96), None);
+        assert_eq!(smooth_drag_velocity(0.0, 0.0, 20, 0, 7, 192), None);
+    }
+
+    #[test]
+    fn drag_velocity_is_equivalent_across_dpi_scales() {
+        let desktop = smooth_drag_velocity(0.0, 0.0, 40, 0, 10, 96).unwrap();
+        let laptop = smooth_drag_velocity(0.0, 0.0, 80, 0, 10, 192).unwrap();
+        assert!((desktop.0 - laptop.0).abs() < 0.01);
+        assert!((desktop.1 - laptop.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn delete_flick_requires_dpi_scaled_travel_and_fresh_velocity() {
+        assert!(fling_delete_ready(2100.0, 110.0, 96, 20));
+        assert!(fling_delete_ready(2100.0, 220.0, 192, 20));
+        assert!(!fling_delete_ready(2100.0, 219.0, 192, 20));
+        assert!(!fling_delete_ready(2100.0, 220.0, 192, 81));
+        assert!(!fling_delete_ready(1999.0, 220.0, 192, 20));
+    }
+
+    #[test]
+    fn handle_grab_halo_reaches_into_empty_top_padding() {
+        let width = 340;
+        let header = header_px(1.0);
+        assert!(!handle_drag_hit(0.0, width / 2, 1, width));
+        // Existing full-width header remains draggable, even far from the pill.
+        assert!(handle_drag_hit(1.0, 2, header - 1, width));
+        // The new centered halo reaches below the visible header/pill.
+        assert!(handle_drag_hit(1.0, width / 2, header + 10, width));
+        // It does not consume resize edges or extend into actual text.
+        assert!(!handle_drag_hit(1.0, 2, header + 10, width));
+        assert!(!handle_drag_hit(
+            1.0,
+            width / 2,
+            header + scf(HANDLE_GRAB_BELOW_DIP).round() as i32,
+            width,
+        ));
     }
 
     #[test]
@@ -3927,11 +4036,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             }
-            // The whole added header is a forgiving drag target, including
-            // its far-left/far-right ends. Resize hit zones begin below it.
-            let handle_h = idx.map(|i| header_px(app.windows[i].header)).unwrap_or(0);
-            if handle_h > 0 && y < r.top + handle_h {
-                return LRESULT(HTCLIENT as isize);
+            // The expanded header plus the centered halo just below its pill
+            // are client-drag territory. Side resize edges remain outside the
+            // halo, and the text begins below it.
+            if let Some(i) = idx {
+                if handle_drag_hit(
+                    app.windows[i].header,
+                    x - r.left,
+                    y - r.top,
+                    r.right - r.left,
+                ) {
+                    return LRESULT(HTCLIENT as isize);
+                }
             }
             let b = RESIZE_BORDER;
             let left = x < r.left + b;
@@ -4151,11 +4267,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             return LRESULT(0);
                         }
                     }
-                    // The new header is drag-only across its full width. Note
-                    // deletion remains an intentional flick or Ctrl+W; there
-                    // is no invisible close target at the right edge anymore.
-                    let handle_h = header_px(app.windows[i].header);
-                    if handle_h > 0 && p.y < r.top + handle_h {
+                    // The visible pill has a generous centered grab halo into
+                    // the empty top padding. The text and resize edges stay out
+                    // of it, so imprecise grabs move instead of starting edits.
+                    if handle_drag_hit(
+                        app.windows[i].header,
+                        p.x - r.left,
+                        p.y - r.top,
+                        r.right - r.left,
+                    ) {
                         unsafe {
                             let _ = SetCapture(hwnd);
                         }
@@ -4353,11 +4473,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     );
                 }
                 let now = unsafe { GetMessageTime() } as u32;
-                let dt = now.wrapping_sub(d.last_t).max(1) as f32;
-                d.vx = 0.6 * d.vx + 0.4 * ((p.x - d.last_pos.x) as f32 * 1000.0 / dt);
-                d.vy = 0.6 * d.vy + 0.4 * ((p.y - d.last_pos.y) as f32 * 1000.0 / dt);
-                d.last_pos = p;
-                d.last_t = now;
+                let elapsed = now.wrapping_sub(d.last_t);
+                let area = monitor_area_at(p);
+                if let Some((vx, vy)) = smooth_drag_velocity(
+                    d.vx,
+                    d.vy,
+                    p.x - d.last_pos.x,
+                    p.y - d.last_pos.y,
+                    elapsed,
+                    area.dpi,
+                ) {
+                    d.vx = vx;
+                    d.vy = vy;
+                    d.last_pos = p;
+                    d.last_t = now;
+                }
                 // The same blue snap-glow previews either destination. Border
                 // docking has priority when both the edge zone and stack overlap.
                 if app.windows[d.idx].free {
@@ -4423,13 +4553,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Flick-to-delete: released with real velocity — hurl the
                     // note off-screen along the throw vector, fading as it
                     // flies; anim_tick advances it and reap_dying trashes it.
-                    let speed = (d.vx * d.vx + d.vy * d.vy).sqrt();
+                    let speed_dip = d.vx.hypot(d.vy);
                     let travel_x = (p.x - d.start_pos.x) as f32;
                     let travel_y = (p.y - d.start_pos.y) as f32;
                     let travel = (travel_x * travel_x + travel_y * travel_y).sqrt();
-                    if speed > FLING_DELETE_SPEED
-                        && travel >= scf(FLING_DELETE_TRAVEL_DIP)
-                    {
+                    let release_t = unsafe { GetMessageTime() } as u32;
+                    let velocity_age = release_t.wrapping_sub(d.last_t);
+                    let release_area = monitor_area_at(p);
+                    if fling_delete_ready(speed_dip, travel, release_area.dpi, velocity_age) {
                         // Record the delete for undo now, while the note is
                         // still at its on-screen spot (before it flies off), so
                         // Ctrl+Z brings it back where it was.
@@ -4445,7 +4576,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         let hpx = (rr.bottom - rr.top) as f32;
                         let rgx = d.grab_dx as f32 - wpx * 0.5;
                         let rgy = d.grab_dy as f32 - hpx * 0.5;
-                        let (fling, spin) = fling_motion(d.vx, d.vy, rgx, rgy);
+                        // Intent is tracked in DIPs/s, but the window animation
+                        // itself moves in physical pixels on this monitor.
+                        let dip_to_px = release_area.dpi as f32 / 96.0;
+                        let (fling, spin) =
+                            fling_motion(d.vx * dip_to_px, d.vy * dip_to_px, rgx, rgy);
                         let w = &mut app.windows[d.idx];
                         w.fling = Some(fling);
                         w.spin = spin;
