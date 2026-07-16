@@ -272,6 +272,81 @@ float4 psglass(VSO i) : SV_Target {
     return float4(col * a, a);
 }
 
+// Compositor-native overlay.  The pixels behind this transparent swapchain are
+// supplied by CreateHostBackdropBrush in DWM's own composition pass; this
+// shader draws only LiquidNotes-owned tint, rim, glow, and text.  It therefore
+// has no desktop texture reads and cannot trail scrolling behind the window.
+float4 psoverlay(VSO i) : SV_Target {
+    float2 size = pane.xy;
+    float2 p = (i.uv - 0.5) * size;
+    float2 halfsz = 0.5 * size;
+    float band = shape.y;
+    float hs = shape.z;
+    float rad = min(shape.x, min(halfsz.x, halfsz.y));
+    float dome = max(refr.y, 1.05);
+    float d = sdrb(p, halfsz, rad);
+    float depth = edgeDepth(p, halfsz, rad);
+
+    float e = 1.0;
+    float hx = domeH(p + float2(e, 0), halfsz, band, dome, rad)
+             - domeH(p - float2(e, 0), halfsz, band, dome, rad);
+    float hy = domeH(p + float2(0, e), halfsz, band, dome, rad)
+             - domeH(p - float2(0, e), halfsz, band, dome, rad);
+    float3 N = normalize(float3(-hx * hs / (2.0 * e), -hy * hs / (2.0 * e), 1.0));
+
+    float mix = saturate(fx.w);
+    float3 fillCol = lerp(float3(0.10, 0.10, 0.12),
+                          float3(0.95, 0.95, 0.97), mix);
+    float3 dangerCol = lerp(float3(0.26, 0.055, 0.070),
+                            float3(1.00, 0.76, 0.79), mix);
+    fillCol = lerp(fillCol, dangerCol, saturate(light.z));
+    float fillA = saturate(light.w + 0.30 * fx.z);
+    float3 outRgb = fillCol * fillA;
+    float outA = fillA;
+
+    // Preserve the directional liquid highlight from the exact renderer.  The
+    // host backdrop supplies the material body while this analytic normal and
+    // border SDF preserve its responsive glass edge.
+    if (light.x > 0.0001) {
+        float rimMask = 1.0 - smoother(0.0, 3.0, -d);
+        float2 Ldir = float2(cos(light.y), sin(light.y));
+        float2 En = normalize(N.xy + float2(1e-5, 0.0));
+        float dirW = 0.5 + 0.5 * dot(En, Ldir);
+        float rimA = saturate(light.x * rimMask * (0.2 + 0.8 * dirW));
+        outRgb = lerp(outRgb, float3(1.0, 1.0, 1.0), rimA);
+        outA = rimA + outA * (1.0 - rimA);
+    }
+
+    int ss = max(1, (int)txcfg.x);
+    float2 tpx = txcfg.yz;
+    float2 c0 = -0.5 * (float(ss) - 1.0) * tpx;
+    float4 txt = 0.0;
+    [loop] for (int ty = 0; ty < ss; ++ty) {
+        [loop] for (int tx = 0; tx < ss; ++tx) {
+            txt += textTex.Sample(samp, i.uv + c0 + float2(tx, ty) * tpx);
+        }
+    }
+    txt /= float(ss * ss);
+    if (txt.a > 0.001) {
+        float3 ink = lerp(float3(0.97, 0.97, 0.98),
+                          float3(0.08, 0.08, 0.10), mix);
+        outRgb = lerp(outRgb, ink, txt.a);
+        outA = txt.a + outA * (1.0 - txt.a);
+    }
+
+    if (fx.y > 0.001) {
+        float glow = fx.y * (1.0 - smoother(0.0, 10.0, -d)) * 0.85;
+        outRgb = lerp(outRgb, float3(0.25, 0.55, 1.0), glow);
+        outA = glow + outA * (1.0 - glow);
+    }
+
+    float coverage = 1.0 - smoothstep(-0.75, 0.75, d);
+    float reveal = saturate(fx.x);
+    outA *= coverage * reveal;
+    outRgb *= coverage * reveal;
+    return float4(outRgb, outA);
+}
+
 // Separable Gaussian; run twice with blur.zw = (1,0) then (0,1).
 // Skipped entirely by the CPU side when the center frost is off.
 float4 psblur(VSO i) : SV_Target {
@@ -281,14 +356,25 @@ float4 psblur(VSO i) : SV_Target {
     float2 dir = blur.zw;
     float3 acc = 0.0;
     float wsum = 0.0;
-    for (int k = -radius; k <= radius; ++k) {
-        float wgt = exp(-0.5 * float(k * k) / (sigma * sigma));
-        // Steer each tap out of the pointer rect, and average in LINEAR light
-        // (gamma ~2 approx) so blurring high-contrast content does not darken.
-        float2 uv = avoidCursor((basePx + dir * float(k)) * src.zw, cursor);
-        float3 s = srcTex.Sample(samp, uv).rgb;
-        acc += s * s * wgt;
-        wsum += wgt;
+    // Centre plus bilinear-paired symmetric taps.  Two neighbouring Gaussian
+    // coefficients become one sample at their weighted fractional position,
+    // nearly halving texture reads (25 -> 13 at the default sigma) while
+    // preserving the same radius and normalized kernel energy.
+    float wc = 1.0;
+    float3 centre = srcTex.Sample(samp, avoidCursor(basePx * src.zw, cursor)).rgb;
+    acc = centre * centre * wc;
+    wsum = wc;
+    for (int k = 1; k <= radius; k += 2) {
+        float w0 = exp(-0.5 * float(k * k) / (sigma * sigma));
+        int k1 = min(k + 1, radius);
+        float w1 = (k1 == k) ? 0.0 : exp(-0.5 * float(k1 * k1) / (sigma * sigma));
+        float pairW = w0 + w1;
+        float offset = (float(k) * w0 + float(k1) * w1) / max(pairW, 1e-6);
+        float2 duv = dir * offset;
+        float3 sp = srcTex.Sample(samp, avoidCursor((basePx + duv) * src.zw, cursor)).rgb;
+        float3 sn = srcTex.Sample(samp, avoidCursor((basePx - duv) * src.zw, cursor)).rgb;
+        acc += (sp * sp + sn * sn) * pairW;
+        wsum += 2.0 * pairW;
     }
     return float4(sqrt(acc / wsum), 1.0);
 }

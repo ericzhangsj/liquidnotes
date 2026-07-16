@@ -1,14 +1,14 @@
 # liquidnotes
 
-Always-on-top sticky notes for Windows with a **real** liquid-glass look — the
-notes refract the live desktop behind them, not a flat blur. One small `.exe`,
-no dependencies.
+Always-on-top sticky notes for Windows with a **real** liquid-glass look and a
+same-composition-frame live backdrop. One small `.exe`, no dependencies.
 
 ## Install
 
-Download `liquidnotes.exe` from the [**Releases**](../../releases) page and run
-it (Windows 10 2004+, 64-bit). A glass **+** button appears at the bottom-right
-of your screen.
+Download the executable for your PC from the [**Releases**](../../releases)
+page: `liquidnotes-x64.exe` for Intel/AMD or `liquidnotes-arm64.exe` for a
+Windows-on-ARM laptop. Run it on Windows 10 2004 or newer; a glass **+** button
+appears at the bottom-right of your screen.
 
 To start it with Windows: right-click the **+** → toggle **Launch on startup**.
 
@@ -54,9 +54,13 @@ To start it with Windows: right-click the **+** → toggle **Launch on startup**
 
 You won't really notice any of this — it's just there to look and read nicely:
 
-- **Real liquid glass.** The engine captures the desktop on the GPU and runs a
-  refraction shader (curved-surface normals → Snell refraction → frost → rim
-  light) per note, so the glass genuinely bends the live background behind it.
+- **Same-frame glass.** By default DWM supplies each note's blurred backdrop in
+  the composition pass that draws the desktop, while LiquidNotes adds its tint,
+  curved-surface rim, glow, and text as a transparent GPU overlay. Scrolling
+  therefore cannot wait on a capture/readback/app-present round trip.
+- **Exact fallback.** `LN_RENDERER=capture` selects the original GPU desktop-
+  duplication renderer with curved-surface refraction, frost, and rim lighting.
+  Its frame queue is capped at one and its luminance readback is asynchronous.
 - **Crisp text.** Note text is rendered supersampled and averaged back down, so
   glyphs stay sharp on any display.
 - **Invisible in captures.** By default notes stay out of screenshots and screen
@@ -74,6 +78,9 @@ Produces a self-contained `target\release\liquidnotes.exe`. Building with the
 GNU toolchain instead of MSVC also needs
 [w64devkit](https://github.com/skeeto/w64devkit) on PATH (for `dlltool` / `as` /
 `windres`).
+
+Official releases are built and tested natively for both
+`x86_64-pc-windows-msvc` and `aarch64-pc-windows-msvc`.
 
 ## License
 

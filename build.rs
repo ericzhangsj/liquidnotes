@@ -31,7 +31,13 @@ fn main() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let rc_path = Path::new(&out_dir).join("app.rc");
-    let obj_path = Path::new(&out_dir).join("app_icon.o");
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let is_msvc = target_env == "msvc";
+    let obj_path = Path::new(&out_dir).join(if is_msvc {
+        "app_icon.res"
+    } else {
+        "app_icon.o"
+    });
 
     // windres wants forward slashes in the .rc path string.
     let ico_str = ico_path.to_string_lossy().replace('\\', "/");
@@ -42,14 +48,24 @@ fn main() {
         return;
     }
 
-    let status = Command::new("windres")
-        .arg("-O")
-        .arg("coff")
-        .arg("-i")
-        .arg(&rc_path)
-        .arg("-o")
-        .arg(&obj_path)
-        .status();
+    let status = if is_msvc {
+        // Native x64 and ARM64 GitHub runners provide the Windows SDK resource
+        // compiler.  LINK accepts its .res output directly.
+        Command::new("rc.exe")
+            .arg("/nologo")
+            .arg(format!("/fo{}", obj_path.to_string_lossy()))
+            .arg(&rc_path)
+            .status()
+    } else {
+        Command::new("windres")
+            .arg("-O")
+            .arg("coff")
+            .arg("-i")
+            .arg(&rc_path)
+            .arg("-o")
+            .arg(&obj_path)
+            .status()
+    };
 
     match status {
         Ok(s) if s.success() => {
@@ -57,10 +73,10 @@ fn main() {
             println!("cargo:rustc-link-arg-bins={}", obj_path.to_string_lossy());
         }
         Ok(s) => {
-            println!("cargo:warning=windres exited with {s}; building without embedded icon");
+            println!("cargo:warning=resource compiler exited with {s}; building without embedded icon");
         }
         Err(e) => {
-            println!("cargo:warning=could not run windres ({e}); building without embedded icon");
+            println!("cargo:warning=could not run resource compiler ({e}); building without embedded icon");
         }
     }
 }

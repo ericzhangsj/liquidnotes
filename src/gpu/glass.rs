@@ -2,6 +2,8 @@
 //! the frost + glass passes. One `GlassRenderer` per app, one `Surface` per
 //! window.
 
+use std::cell::Cell;
+
 use windows::core::*;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D::*;
@@ -11,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
 use super::capture::Capture;
+use super::compositor::{HostCompositor, HostSurface};
 use super::device::{blob_bytes, compile_shader, Gpu};
 use crate::material::GlassMaterial;
 use crate::text::TextRenderer;
@@ -38,8 +41,12 @@ pub struct GlassRenderer {
     context: ID3D11DeviceContext,
     factory: IDXGIFactory2,
     dcomp: IDCompositionDevice,
+    host: Option<HostCompositor>,
+    host_usable: Cell<bool>,
+    require_host: bool,
     vs: ID3D11VertexShader,
     ps_glass: ID3D11PixelShader,
+    ps_overlay: ID3D11PixelShader,
     ps_blur: ID3D11PixelShader,
     ps_shadow: ID3D11PixelShader,
     sampler: ID3D11SamplerState,
@@ -66,12 +73,19 @@ pub struct Surface {
     text_tex: ID3D11Texture2D,
     text_srv: ID3D11ShaderResourceView,
     text_bitmap: ID2D1Bitmap1,
-    // Kept alive: dropping them tears the visual off the window.
-    _target: IDCompositionTarget,
-    _visual: IDCompositionVisual,
-    // Lazy rotate transform on the visual (flick-delete throw spin); notes
-    // that never fling never get one, so they stay untransformed.
-    rot: Option<IDCompositionRotateTransform>,
+    composition: SurfaceComposition,
+    present_pending: Cell<bool>,
+}
+
+enum SurfaceComposition {
+    Capture {
+        // Kept alive: dropping them tears the visual off the window.
+        _target: IDCompositionTarget,
+        visual: IDCompositionVisual,
+        // Lazy rotate transform on the visual (flick-delete throw spin).
+        rot: Option<IDCompositionRotateTransform>,
+    },
+    Host(HostSurface),
 }
 
 impl GlassRenderer {
@@ -96,6 +110,7 @@ impl GlassRenderer {
 
             let vsb = compile_shader(src, s!("vsmain"), s!("vs_5_0"))?;
             let psb = compile_shader(src, s!("psglass"), s!("ps_5_0"))?;
+            let ovb = compile_shader(src, s!("psoverlay"), s!("ps_5_0"))?;
             let blb = compile_shader(src, s!("psblur"), s!("ps_5_0"))?;
             let mut vs = None;
             gpu.device
@@ -103,6 +118,9 @@ impl GlassRenderer {
             let mut ps_glass = None;
             gpu.device
                 .CreatePixelShader(blob_bytes(&psb), None, Some(&mut ps_glass))?;
+            let mut ps_overlay = None;
+            gpu.device
+                .CreatePixelShader(blob_bytes(&ovb), None, Some(&mut ps_overlay))?;
             let mut ps_blur = None;
             gpu.device
                 .CreatePixelShader(blob_bytes(&blb), None, Some(&mut ps_blur))?;
@@ -133,14 +151,35 @@ impl GlassRenderer {
             gpu.device.CreateBuffer(&cdesc, None, Some(&mut cbuf))?;
 
             let text = TextRenderer::new(&gpu.device)?;
+            let renderer_preference = std::env::var("LN_RENDERER")
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let force_capture = matches!(
+                renderer_preference.as_str(),
+                "capture" | "exact" | "legacy"
+            );
+            let require_host = matches!(renderer_preference.as_str(), "instant" | "host");
+            let host = if force_capture {
+                None
+            } else if require_host {
+                Some(HostCompositor::new(
+                    crate::material::GlassMaterial::from_env().frost,
+                )?)
+            } else {
+                HostCompositor::new(crate::material::GlassMaterial::from_env().frost).ok()
+            };
 
             Ok(Self {
                 device: gpu.device.clone(),
                 context: gpu.context.clone(),
                 factory,
                 dcomp,
+                host_usable: Cell::new(host.is_some()),
+                host,
+                require_host,
                 vs: vs.unwrap(),
                 ps_glass: ps_glass.unwrap(),
+                ps_overlay: ps_overlay.unwrap(),
                 ps_blur: ps_blur.unwrap(),
                 ps_shadow: ps_shadow.unwrap(),
                 sampler: sampler.unwrap(),
@@ -232,6 +271,13 @@ impl GlassRenderer {
         self.text.draw_startup(&s.text_bitmap, s.width, s.height, on)
     }
 
+    /// True when DWM owns the visible backdrop and updates it in the same
+    /// composition pass.  In this mode desktop capture is not on the visual
+    /// frame path and can be throttled to the colour probe cadence.
+    pub fn is_instant(&self) -> bool {
+        self.host.is_some() && self.host_usable.get()
+    }
+
     /// Draw the persisted hidden-note hover-reveal toggle using the same visual
     /// language as the launch-on-startup switch.
     pub fn draw_slide_hidden(&self, s: &Surface, on: bool) -> Result<()> {
@@ -289,7 +335,7 @@ impl GlassRenderer {
         let rtv = s.rtv.clone().expect("surface has no rtv");
         let srv = s.text_srv.clone();
         self.pass(&self.ps_shadow, &rtv, &srv, Some(&srv), Some(&srv), w, h, &p)?;
-        unsafe { s.swapchain.Present(0, DXGI_PRESENT(0)).ok()? }
+        self.present(s)?;
         Ok(())
     }
 
@@ -315,6 +361,28 @@ impl GlassRenderer {
     }
 
     pub fn create_surface(&self, hwnd: HWND, width: u32, height: u32) -> Result<Surface> {
+        self.create_surface_inner(hwnd, width, height, true)
+    }
+
+    /// Create a transparent composition surface with no host backdrop.  Used
+    /// by the soft-shadow companion windows, whose pixels must remain only the
+    /// pre-rendered alpha shadow.
+    pub fn create_overlay_surface(
+        &self,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+    ) -> Result<Surface> {
+        self.create_surface_inner(hwnd, width, height, false)
+    }
+
+    fn create_surface_inner(
+        &self,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        backdrop_enabled: bool,
+    ) -> Result<Surface> {
         unsafe {
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width.max(8),
@@ -326,16 +394,53 @@ impl GlassRenderer {
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
                 ..Default::default()
             };
             let swapchain =
                 self.factory
                     .CreateSwapChainForComposition(&self.device, &desc, None)?;
-            let target = self.dcomp.CreateTargetForHwnd(hwnd, true)?;
-            let visual = self.dcomp.CreateVisual()?;
-            visual.SetContent(&swapchain)?;
-            target.SetRoot(&visual)?;
-            self.dcomp.Commit()?;
+            let swapchain2: IDXGISwapChain2 = swapchain.cast()?;
+            swapchain2.SetMaximumFrameLatency(1)?;
+            let composition = if let Some(host) = &self.host {
+                match host.create_surface(
+                    hwnd,
+                    &swapchain,
+                    width.max(8),
+                    height.max(8),
+                    crate::material::GlassMaterial::from_env().corner_radius,
+                    backdrop_enabled,
+                ) {
+                    Ok(surface) => SurfaceComposition::Host(surface),
+                    Err(error) if self.require_host => return Err(error),
+                    Err(_) => {
+                        // Ensure the capture pump stays active for this and any
+                        // later compatibility surfaces after host interop fails.
+                        self.host_usable.set(false);
+                        let target = self.dcomp.CreateTargetForHwnd(hwnd, true)?;
+                        let visual = self.dcomp.CreateVisual()?;
+                        visual.SetContent(&swapchain)?;
+                        target.SetRoot(&visual)?;
+                        self.dcomp.Commit()?;
+                        SurfaceComposition::Capture {
+                            _target: target,
+                            visual,
+                            rot: None,
+                        }
+                    }
+                }
+            } else {
+                let target = self.dcomp.CreateTargetForHwnd(hwnd, true)?;
+                let visual = self.dcomp.CreateVisual()?;
+                visual.SetContent(&swapchain)?;
+                target.SetRoot(&visual)?;
+                self.dcomp.Commit()?;
+                SurfaceComposition::Capture {
+                    _target: target,
+                    visual,
+                    rot: None,
+                }
+            };
 
             let (text_tex, text_srv, text_bitmap) = self.make_text(width.max(8), height.max(8))?;
             let mut s = Surface {
@@ -347,9 +452,8 @@ impl GlassRenderer {
                 text_tex,
                 text_srv,
                 text_bitmap,
-                _target: target,
-                _visual: visual,
-                rot: None,
+                composition,
+                present_pending: Cell::new(false),
             };
             s.rtv = Some(self.backbuffer_rtv(&s)?);
             Ok(s)
@@ -370,21 +474,46 @@ impl GlassRenderer {
     /// rotate transform is created and attached lazily on first use and
     /// cached in the surface; later calls just retune angle/center + Commit.
     pub fn set_rotation(&self, s: &mut Surface, deg: f32, cx: f32, cy: f32) -> Result<()> {
-        unsafe {
-            if s.rot.is_none() {
-                let t = self.dcomp.CreateRotateTransform()?;
-                s._visual.SetTransform(&t)?;
-                s.rot = Some(t);
+        match &mut s.composition {
+            SurfaceComposition::Host(host) => host.set_rotation(deg, cx, cy),
+            SurfaceComposition::Capture { visual, rot, .. } => unsafe {
+                if rot.is_none() {
+                    let t = self.dcomp.CreateRotateTransform()?;
+                    visual.SetTransform(&t)?;
+                    *rot = Some(t);
+                }
+                let t = rot.as_ref().unwrap();
+                t.SetAngle2(deg)?;
+                t.SetCenterX2(cx)?;
+                t.SetCenterY2(cy)?;
+                self.dcomp.Commit()?;
+                Ok(())
             }
-            let t = s.rot.as_ref().unwrap();
-            // The plain SetAngle/SetCenterX/SetCenterY take an animation; the
-            // `2` overloads take a scalar f32.
-            t.SetAngle2(deg)?;
-            t.SetCenterX2(cx)?;
-            t.SetCenterY2(cy)?;
-            self.dcomp.Commit()?;
         }
-        Ok(())
+    }
+
+    /// Submit without ever waiting behind an older queued composition frame.
+    /// A skipped overlay/capture present is preferable to blocking input; the
+    /// next animation or desktop tick carries the newest complete state.
+    fn present(&self, s: &Surface) -> Result<()> {
+        let hr = unsafe { s.swapchain.Present(0, DXGI_PRESENT_DO_NOT_WAIT) };
+        if hr == DXGI_ERROR_WAS_STILL_DRAWING {
+            s.present_pending.set(true);
+            Ok(())
+        } else {
+            hr.ok()?;
+            s.present_pending.set(false);
+            Ok(())
+        }
+    }
+
+    /// Retry a non-blocking present that previously found the one-frame queue
+    /// busy.  This guarantees the final animation/text frame is eventually
+    /// shown without ever making the message loop wait for it.
+    pub fn retry_present(&self, s: &Surface) {
+        if s.present_pending.get() {
+            let _ = self.present(s);
+        }
     }
 
     pub fn resize(&self, s: &mut Surface, width: u32, height: u32) -> Result<()> {
@@ -394,8 +523,13 @@ impl GlassRenderer {
         }
         s.rtv = None;
         unsafe {
-            s.swapchain
-                .ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0))?;
+            s.swapchain.ResizeBuffers(
+                0,
+                width,
+                height,
+                DXGI_FORMAT_UNKNOWN,
+                DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+            )?;
         }
         s.width = width;
         s.height = height;
@@ -406,6 +540,9 @@ impl GlassRenderer {
         s.text_tex = tex;
         s.text_srv = srv;
         s.text_bitmap = bitmap;
+        if let SurfaceComposition::Host(host) = &s.composition {
+            host.set_size(width, height, crate::material::GlassMaterial::from_env().corner_radius)?;
+        }
         Ok(())
     }
 
@@ -494,8 +631,8 @@ impl GlassRenderer {
                 0,
                 Some(&[
                     Some(srv0.clone()),
-                    srv1.map(|s| s.clone()),
-                    srv2.map(|s| s.clone()),
+                    srv1.cloned(),
+                    srv2.cloned(),
                 ]),
             );
             ctx.PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
@@ -588,6 +725,22 @@ impl GlassRenderer {
 
         let rtv = s.rtv.clone().expect("surface has no rtv");
         let text_srv = s.text_srv.clone();
+        if let SurfaceComposition::Host(host) = &s.composition {
+            host.set_size(w, h, mat.corner_radius)?;
+            host.set_reveal(reveal)?;
+            self.pass(
+                &self.ps_overlay,
+                &rtv,
+                &cap.srv,
+                Some(&cap.srv),
+                Some(&text_srv),
+                w,
+                h,
+                &p,
+            )?;
+            self.present(s)?;
+            return Ok(());
+        }
         let do_frost = sigma > 0.25;
         if do_frost {
             // Frost: blur a margin-expanded region of the background into t1,
@@ -644,7 +797,7 @@ impl GlassRenderer {
             )?;
         }
 
-        unsafe { s.swapchain.Present(0, DXGI_PRESENT(0)).ok()? }
+        self.present(s)?;
         Ok(())
     }
 }

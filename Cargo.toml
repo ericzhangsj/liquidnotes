@@ -1,13 +1,18 @@
 [package]
 name = "liquidnotes"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
-description = "Sticky notes with a real liquid-glass material: GPU desktop capture + refraction shader"
+description = "Sticky notes with same-frame Windows compositor liquid glass"
 license = "MIT"
 
 [dependencies.windows]
 version = "0.61"
 features = [
+    "Foundation",
+    "Graphics_Effects",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -28,6 +33,9 @@ features = [
     "Win32_System_Performance",
     "Win32_System_Registry",
     "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -36,6 +44,9 @@ features = [
 
 [dependencies.windows-numerics]
 version = "0.2"
+
+[dependencies.windows-core]
+version = "0.61"
 
 [profile.release]
 opt-level = 3

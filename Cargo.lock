@@ -4,9 +4,10 @@ version = 4
 
 [[package]]
 name = "liquidnotes"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "windows",
+ "windows-core",
  "windows-numerics",
 ]
 

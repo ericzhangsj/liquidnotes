@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod compositor;
 pub mod device;
 pub mod glass;
 

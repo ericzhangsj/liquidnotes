@@ -642,21 +642,30 @@ fn main() -> Result<()> {
     set_ui_scale(dpi_scale * saved.user_scale);
 
     let gpu = Gpu::new()?;
-    let mut cap = Capture::new(&gpu)?;
-    // Seed the background before any of our windows exist, so the pixels
-    // under future windows are already known.
-    for _ in 0..300 {
-        cap.tick(&[]);
-        if cap.seeded() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if !cap.seeded() {
-        // Static screen: grab one frame the blocking way.
-        let _ = cap.force_full_refresh(1000);
-    }
+    // Select the renderer before seeding desktop duplication.  The compositor
+    // path does not display captured pixels, so it should never pay a multi-
+    // second capture warm-up before the first window can appear.
     let renderer = GlassRenderer::new(&gpu)?;
+    let mut cap = Capture::new(&gpu)?;
+    if renderer.is_instant() {
+        // One non-blocking sample is enough to prime the adaptive colour probe;
+        // the visible host backdrop is already owned and refreshed by DWM.
+        let _ = cap.tick(&[]);
+    } else {
+        // Exact fallback: seed the background before any of our windows exist,
+        // so the pixels under future windows are already known.
+        for _ in 0..300 {
+            cap.tick(&[]);
+            if cap.seeded() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !cap.seeded() {
+            // Static screen: grab one frame the blocking way.
+            let _ = cap.force_full_refresh(1000);
+        }
+    }
 
     let mut app = Box::new(App {
         cap,
@@ -2185,6 +2194,12 @@ impl App {
         //     moment it isn't (kept cheap so switching back is easy).
         // A threshold crossing must still persist ~0.1 s before it commits, so a
         // brief pass over a bright patch never flickers.
+        if self.renderer.is_instant() {
+            // Capture is only a low-rate colour sensor in compositor mode.  It
+            // never gates the visible backdrop or a presentation frame.
+            let rects = if self.live { Vec::new() } else { self.window_rects() };
+            let _ = self.cap.tick(&rects);
+        }
         self.cap.update_lum();
         const GROUP_DIST: i32 = 60; // edge-to-edge px to count as "bunched"
         const T_WB_SOLO: f32 = 0.30; // solo: white -> black below this
@@ -3361,7 +3376,7 @@ impl App {
             if self.live {
                 let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
             }
-            let surface = self.renderer.create_surface(hwnd, 8, 8)?;
+            let surface = self.renderer.create_overlay_surface(hwnd, 8, 8)?;
             self.windows[i].shadow = Some(hwnd);
             self.windows[i].shadow_surface = Some(surface);
             self.windows[i].shadow_shown = false;
@@ -3575,8 +3590,12 @@ impl App {
     fn pump(&mut self, force_render: bool) -> bool {
         // Live mode: our windows never appear in capture frames, so nothing
         // needs masking and the pixels under notes stay current.
-        let rects = if self.live { Vec::new() } else { self.window_rects() };
-        let updated = self.cap.tick(&rects);
+        let updated = if self.renderer.is_instant() {
+            false
+        } else {
+            let rects = if self.live { Vec::new() } else { self.window_rects() };
+            self.cap.tick(&rects)
+        };
         if updated || force_render {
             // Only re-render notes whose backdrop actually changed. The glass
             // samples beyond its own rect (refraction displacement + frost
@@ -3599,6 +3618,15 @@ impl App {
                     }
                 }
                 self.render_one(i);
+            }
+        }
+        // Presents are deliberately non-blocking.  Retry any surface whose
+        // one-frame queue was busy, including static shadow companions, so a
+        // final state can never remain stranded after an animation ends.
+        for window in &self.windows {
+            self.renderer.retry_present(&window.surface);
+            if let Some(shadow) = &window.shadow_surface {
+                self.renderer.retry_present(shadow);
             }
         }
         updated

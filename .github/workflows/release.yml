@@ -8,20 +8,53 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: liquidnotes-x64.exe
+          - name: Windows ARM64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: liquidnotes-arm64.exe
+    runs-on: ${{ matrix.runner }}
     permissions:
-      contents: write # required for the release step to create/attach to a Release
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - name: Build
-        run: cargo build --release
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Test natively
+        run: cargo test --release --target ${{ matrix.target }}
+      - name: Build release executable
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Name release asset
+        shell: pwsh
+        run: Copy-Item "target/${{ matrix.target }}/release/liquidnotes.exe" "${{ matrix.asset }}"
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: liquidnotes
-          path: target/release/liquidnotes.exe
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download architecture assets
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/liquidnotes.exe
+          files: release-assets/*.exe

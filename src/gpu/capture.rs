@@ -55,8 +55,23 @@ impl Capture {
                 odesc.DesktopCoordinates.top,
             );
             let output1: IDXGIOutput1 = output.cast()?;
-            let dupl = output1.DuplicateOutput(&gpu.device)?;
-            let ddesc = dupl.GetDesc();
+            // Host-backdrop mode must still launch on HDR, remote sessions, or
+            // drivers that temporarily reject output duplication. Keep a
+            // correctly-sized neutral texture and retry later; only accept a
+            // duplication object whose format matches the exact shader.
+            let dupl = output1
+                .DuplicateOutput(&gpu.device)
+                .ok()
+                .filter(|dupl| dupl.GetDesc().ModeDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+            let ddesc = dupl.as_ref().map(|dupl| dupl.GetDesc()).unwrap_or_else(|| {
+                let mut desc = DXGI_OUTDUPL_DESC::default();
+                desc.ModeDesc.Width =
+                    (odesc.DesktopCoordinates.right - odesc.DesktopCoordinates.left).max(1) as u32;
+                desc.ModeDesc.Height =
+                    (odesc.DesktopCoordinates.bottom - odesc.DesktopCoordinates.top).max(1) as u32;
+                desc.ModeDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                desc
+            });
             if ddesc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
                 return Err(Error::new(
                     E_FAIL,
@@ -93,7 +108,7 @@ impl Capture {
                 device: gpu.device.clone(),
                 context: gpu.context.clone(),
                 output1,
-                dupl: Some(dupl),
+                dupl,
                 background,
                 srv: srv.unwrap(),
                 width,
@@ -136,7 +151,13 @@ impl Capture {
             // Access was lost (mode change, secure desktop, fullscreen
             // exclusive). Re-duplication fails until the OS allows it again.
             match unsafe { self.output1.DuplicateOutput(&self.device) } {
-                Ok(d) => self.dupl = Some(d),
+                Ok(d)
+                    if unsafe { d.GetDesc().ModeDesc.Format }
+                        == DXGI_FORMAT_B8G8R8A8_UNORM =>
+                {
+                    self.dupl = Some(d)
+                }
+                Ok(_) => return false,
                 Err(_) => return false,
             }
         }
@@ -443,7 +464,12 @@ fn subtract_rect(r: RECT, holes: &[RECT]) -> Vec<RECT> {
 struct LumProbe {
     mip: ID3D11Texture2D,
     mip_srv: ID3D11ShaderResourceView,
-    stage: ID3D11Texture2D,
+    /// Two readback slots keep the CPU one probe behind the GPU.  Mapping uses
+    /// DO_NOT_WAIT, so a colour decision is allowed to stay one 90 ms sample
+    /// older instead of ever stalling a UI/animation frame.
+    stages: [ID3D11Texture2D; 2],
+    pending: [bool; 2],
+    next_stage: usize,
     /// Mip level read back (the one ~<=96 px on the long axis).
     level: u32,
     sw: u32,
@@ -476,7 +502,7 @@ impl LumProbe {
 
             // Read back the mip level nearest ~96 px on the long axis.
             let mut level = 0u32;
-            while (width >> level) > 96 && (width >> level) > 1 {
+            while (width.max(height) >> level) > 96 {
                 level += 1;
             }
             let sw = (width >> level).max(1);
@@ -494,13 +520,18 @@ impl LumProbe {
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
                 MiscFlags: 0,
             };
-            let mut stage = None;
-            device.CreateTexture2D(&sdesc, None, Some(&mut stage))?;
+            let make_stage = || -> Result<ID3D11Texture2D> {
+                let mut stage = None;
+                device.CreateTexture2D(&sdesc, None, Some(&mut stage))?;
+                Ok(stage.unwrap())
+            };
 
             Ok(Self {
                 mip,
                 mip_srv: mip_srv.unwrap(),
-                stage: stage.unwrap(),
+                stages: [make_stage()?, make_stage()?],
+                pending: [false; 2],
+                next_stage: 0,
                 level,
                 sw,
                 sh,
@@ -512,32 +543,62 @@ impl LumProbe {
 
     fn update(&mut self, ctx: &ID3D11DeviceContext, background: &ID3D11Texture2D) {
         unsafe {
-            // Copy the full-res backdrop into mip 0, box-filter down the chain,
-            // then pull the small level into the CPU-readable staging texture.
+            // Consume whichever prior slot the GPU has finished.  Never ask
+            // D3D to wait: adaptive colour is intentionally soft real-time.
+            for slot in 0..self.stages.len() {
+                if !self.pending[slot] {
+                    continue;
+                }
+                let mut m = D3D11_MAPPED_SUBRESOURCE::default();
+                if ctx
+                    .Map(
+                        &self.stages[slot],
+                        0,
+                        D3D11_MAP_READ,
+                        D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                        Some(&mut m),
+                    )
+                    .is_ok()
+                {
+                    let pitch = m.RowPitch as usize;
+                    let base = m.pData as *const u8;
+                    for y in 0..self.sh as usize {
+                        let row = base.add(y * pitch);
+                        for x in 0..self.sw as usize {
+                            let px = row.add(x * 4); // BGRA
+                            let b = *px as f32;
+                            let g = *px.add(1) as f32;
+                            let r = *px.add(2) as f32;
+                            self.data[y * self.sw as usize + x] =
+                                (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+                        }
+                    }
+                    ctx.Unmap(&self.stages[slot], 0);
+                    self.pending[slot] = false;
+                    self.ready = true;
+                }
+            }
+
+            // Queue the next GPU reduction only when a staging slot is free.
+            // If both are still busy, retain the last complete grid and leave.
+            let slot = (0..self.stages.len())
+                .map(|step| (self.next_stage + step) % self.stages.len())
+                .find(|&slot| !self.pending[slot]);
+            let Some(slot) = slot else { return };
             ctx.CopySubresourceRegion(&self.mip, 0, 0, 0, 0, background, 0, None);
             ctx.GenerateMips(&self.mip_srv);
-            ctx.CopySubresourceRegion(&self.stage, 0, 0, 0, 0, &self.mip, self.level, None);
-            let mut m = D3D11_MAPPED_SUBRESOURCE::default();
-            if ctx
-                .Map(&self.stage, 0, D3D11_MAP_READ, 0, Some(&mut m))
-                .is_ok()
-            {
-                let pitch = m.RowPitch as usize;
-                let base = m.pData as *const u8;
-                for y in 0..self.sh as usize {
-                    let row = base.add(y * pitch);
-                    for x in 0..self.sw as usize {
-                        let px = row.add(x * 4); // BGRA
-                        let b = *px as f32;
-                        let g = *px.add(1) as f32;
-                        let r = *px.add(2) as f32;
-                        self.data[y * self.sw as usize + x] =
-                            (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
-                    }
-                }
-                ctx.Unmap(&self.stage, 0);
-                self.ready = true;
-            }
+            ctx.CopySubresourceRegion(
+                &self.stages[slot],
+                0,
+                0,
+                0,
+                0,
+                &self.mip,
+                self.level,
+                None,
+            );
+            self.pending[slot] = true;
+            self.next_stage = (slot + 1) % self.stages.len();
         }
     }
 
