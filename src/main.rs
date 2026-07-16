@@ -98,6 +98,41 @@ fn handle_drag_hit(header_frac: f32, local_x: i32, local_y: i32, width: i32) -> 
     local_y < halo_bottom && local_x >= halo_left && local_x < halo_left + halo_w
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RestoredNoteLayout {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    font_size: f32,
+}
+
+/// Convert persisted note pixels from their saved effective UI scale to the
+/// scale selected for this launch. Version 2 included the always-visible
+/// header in its saved rectangle; version 3 stores only the compact body.
+fn restored_note_layout(
+    note: &NoteData,
+    store_version: u32,
+    saved_layout_scale: f32,
+    current_scale: f32,
+) -> RestoredNoteLayout {
+    let ratio = current_scale / saved_layout_scale.max(f32::EPSILON);
+    let stored_header = if store_version == 2 {
+        (NOTE_HEADER * current_scale).round() as i32
+    } else {
+        0
+    };
+    RestoredNoteLayout {
+        x: (note.x as f32 * ratio).round() as i32,
+        // Remove the legacy header while keeping the body and bottom edge in
+        // the same scaled position.
+        y: (note.y as f32 * ratio).round() as i32 + stored_header,
+        w: ((note.w as f32 * ratio).round() as i32).max(1),
+        h: ((note.h as f32 * ratio).round() as i32 - stored_header).max(1),
+        font_size: note.font_size * ratio,
+    }
+}
+
 /// Notes separated by the resting gap behave like a vertical chain. Starting at
 /// `root`, return every horizontally-overlapping note in the same non-zero group
 /// connected above it. Groups keep ordinary free notes and each monitor/edge's
@@ -150,9 +185,35 @@ const DOCK_PEEK: f32 = 0.20;
 /// clicking/focusing advances it to the second, more pronounced stop.
 const DOCK_HOVER_INSET_DIP: f32 = 5.0;
 const DOCK_CLICK_INSET_DIP: f32 = 10.0;
+/// Extra hover hit area on the screen-edge side of a revealed docked note.
+/// Full reveal intentionally leaves a small gap to the border; without this
+/// cushion, a cursor held against that border falls outside the moving window,
+/// causing a leave/reveal loop. Converted with the note monitor's DPI.
+const DOCK_HOVER_EDGE_PADDING_DIP: f32 = 16.0;
 /// Vertical gap between notes docked on the same edge. Match the free-note and
 /// stack spacing so moving a note into the border does not tighten the layout.
 const DOCK_GAP: i32 = STACK_GAP;
+
+/// Is the cursor over a docked note or its small edge-side activation cushion?
+/// Only the side facing the border is expanded, so the note still retracts as
+/// soon as the pointer moves away toward the desktop or past it vertically.
+fn dock_hover_hit(side: i8, rect: RECT, cursor: POINT, edge_padding_px: i32) -> bool {
+    let padding = edge_padding_px.max(0);
+    let left = if side < 0 {
+        rect.left.saturating_sub(padding)
+    } else {
+        rect.left
+    };
+    let right = if side > 0 {
+        rect.right.saturating_add(padding)
+    } else {
+        rect.right
+    };
+    cursor.x >= left
+        && cursor.x < right
+        && cursor.y >= rect.top
+        && cursor.y < rect.bottom
+}
 
 /// Manual size-slider stops: a multiplier applied on top of the auto-DPI scale
 /// (index 2 = 1.0 = auto only). Lets the user nudge everything bigger/smaller.
@@ -561,16 +622,24 @@ fn main() -> Result<()> {
         m
     };
 
+    // Keep an existing launch-on-login registration pointed at this build.
+    // This matters after an update or when the exe is moved: older versions
+    // treated any Run value as "enabled", even if it named a file that no
+    // longer existed, leaving the toggle on while Windows launched nothing.
+    repair_startup_registration();
+
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     // The app renders at real pixels (needed so the glass refraction lines up
     // with the captured desktop), so it must scale its own UI by the display's
     // DPI — otherwise everything is tiny on a high-DPI laptop. This is the
-    // auto part; the user's manual size slider multiplies on top (see
-    // apply_scale, loaded from the store below).
+    // auto part; the user's persisted manual size slider multiplies on top.
+    // Load it BEFORE creating any window so the +, restored notes, and settings
+    // pills all share one scale from their very first frame.
     let dpi_scale = unsafe { GetDpiForSystem() as f32 / 96.0 };
-    set_ui_scale(dpi_scale);
+    let saved = store::load();
+    set_ui_scale(dpi_scale * saved.user_scale);
 
     let gpu = Gpu::new()?;
     let mut cap = Capture::new(&gpu)?;
@@ -597,7 +666,7 @@ fn main() -> Result<()> {
         focused: None,
         caret_on: true,
         live: std::env::var("LN_BACKDROP").map(|v| v != "capture").unwrap_or(true),
-        next_id: 1,
+        next_id: saved.next_id.max(1),
         dirty: false,
         dragging: None,
         selecting: false,
@@ -609,7 +678,7 @@ fn main() -> Result<()> {
         last_click_idx: usize::MAX,
         click_count: 0,
         menu_open: false,
-        slide_out_hidden_notes: false,
+        slide_out_hidden_notes: saved.slide_out_hidden_notes,
         catcher: None,
         tuck: 0.0,
         tuck_to: 0.0,
@@ -617,7 +686,7 @@ fn main() -> Result<()> {
         menu_slide: 0.0,
         menu_slide_to: 0.0,
         dpi_scale,
-        user_scale: 1.0,
+        user_scale: saved.user_scale,
         rescaling: false,
         header_resizing: false,
         manual_sizing: None,
@@ -714,30 +783,12 @@ fn main() -> Result<()> {
             'N' as u32,
         );
 
-        // Restore persisted notes before entering the message loop.
-        let saved = store::load();
-        app.next_id = saved.next_id.max(1);
-        app.slide_out_hidden_notes = saved.slide_out_hidden_notes;
-        // Apply the persisted manual size multiplier, then rescale the saved
-        // note pixels from the scale they were written at to the current
-        // effective scale — so opening notes on a higher-DPI display (or after
-        // moving the size slider) brings them back the right physical size.
-        app.user_scale = saved.user_scale;
-        set_ui_scale(app.dpi_scale * app.user_scale);
-        let load_ratio = ui_scale() / saved.layout_scale;
+        // Restore persisted notes before entering the message loop, converting
+        // their saved pixel geometry to this launch's already-selected scale.
         for n in &saved.notes {
-            let nw = ((n.w as f32 * load_ratio).round() as i32).max(1);
-            let stored_header = if saved.version == 2 {
-                scf(NOTE_HEADER).round() as i32
-            } else {
-                0
-            };
-            let nh = ((n.h as f32 * load_ratio).round() as i32 - stored_header).max(1);
-            let sx = (n.x as f32 * load_ratio).round() as i32;
-            // Version 2 persisted the always-visible header. Version 3 stores
-            // only the compact body; remove that old header once while keeping
-            // the body and bottom edge in the same place.
-            let sy = (n.y as f32 * load_ratio).round() as i32 + stored_header;
+            let layout =
+                restored_note_layout(n, saved.version, saved.layout_scale, ui_scale());
+            let (nw, nh, sx, sy) = (layout.w, layout.h, layout.x, layout.y);
             // A note saved on a now-disconnected monitor comes back on-screen
             // (docked notes recompute from the current work area below).
             let (nx, ny) = if n.docked == 0 {
@@ -755,7 +806,7 @@ fn main() -> Result<()> {
                 w.free = n.free;
                 w.docked = n.docked;
                 w.color = n.color;
-                w.font_size = n.font_size * load_ratio;
+                w.font_size = layout.font_size;
                 app.update_text(i);
                 // A note saved docked comes back as a sliver, recomputed from
                 // the current work area (absorbs screen-size changes).
@@ -1023,17 +1074,69 @@ fn parse_html(s: &str) -> (Vec<char>, Vec<u8>) {
     (text, attrs)
 }
 
-/// Is the launch-on-login Run entry present? True iff the "liquidnotes"
-/// value exists under HKCU\...\CurrentVersion\Run.
-fn startup_enabled() -> bool {
+/// Read the launch-on-login command, excluding its terminating NUL.
+fn startup_command() -> Option<String> {
     unsafe {
         let mut key = HKEY::default();
         if RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, Some(0), KEY_READ, &mut key).is_err() {
-            return false;
+            return None;
         }
-        let found = RegQueryValueExW(key, RUN_VALUE, None, None, None, None).is_ok();
+
+        let mut byte_len = 0u32;
+        let sized = RegQueryValueExW(
+            key,
+            RUN_VALUE,
+            None,
+            None,
+            None,
+            Some(&mut byte_len),
+        )
+        .is_ok();
+        if !sized || byte_len < std::mem::size_of::<u16>() as u32 {
+            let _ = RegCloseKey(key);
+            return None;
+        }
+
+        let mut wide = vec![0u16; (byte_len as usize).div_ceil(std::mem::size_of::<u16>())];
+        let read = RegQueryValueExW(
+            key,
+            RUN_VALUE,
+            None,
+            None,
+            Some(wide.as_mut_ptr().cast()),
+            Some(&mut byte_len),
+        )
+        .is_ok();
         let _ = RegCloseKey(key);
-        found
+        if !read {
+            return None;
+        }
+
+        let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+        String::from_utf16(&wide[..end]).ok()
+    }
+}
+
+fn current_startup_command() -> Option<String> {
+    std::env::current_exe()
+        .ok()
+        .map(|exe| format!("\"{}\"", exe.display()))
+}
+
+/// True only when Windows is registered to launch this executable. Windows
+/// paths are case-insensitive, so compare the generated commands likewise.
+fn startup_enabled() -> bool {
+    match (startup_command(), current_startup_command()) {
+        (Some(registered), Some(current)) => registered.eq_ignore_ascii_case(&current),
+        _ => false,
+    }
+}
+
+/// Preserve the user's enabled setting across app updates and moves. We only
+/// repair an entry that already exists; absence still means the user opted out.
+fn repair_startup_registration() {
+    if startup_command().is_some() && !startup_enabled() {
+        set_startup(true);
     }
 }
 
@@ -1047,8 +1150,7 @@ fn set_startup(on: bool) {
             return;
         }
         if on {
-            if let Ok(exe) = std::env::current_exe() {
-                let cmd = format!("\"{}\"", exe.display());
+            if let Some(cmd) = current_startup_command() {
                 let mut wide: Vec<u16> = cmd.encode_utf16().collect();
                 wide.push(0);
                 let bytes = std::slice::from_raw_parts(
@@ -1167,6 +1269,71 @@ mod fling_tests {
         assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 96), 50);
         assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 144), 75);
         assert_eq!(dip_to_monitor_px(DOCK_CURSOR_RADIUS_DIP, 192), 100);
+    }
+
+    fn saved_note(x: i32, y: i32, w: i32, h: i32, font_size: f32) -> NoteData {
+        NoteData {
+            id: 1,
+            text: String::new(),
+            x,
+            y,
+            w,
+            h,
+            free: true,
+            docked: 0,
+            color: 0,
+            font_size,
+        }
+    }
+
+    #[test]
+    fn first_launch_restores_v3_notes_at_the_selected_scale() {
+        let note = saved_note(10, 20, 340, 66, 16.0);
+        assert_eq!(
+            restored_note_layout(&note, 3, 1.0, 1.5),
+            RestoredNoteLayout {
+                x: 15,
+                y: 30,
+                w: 510,
+                h: 99,
+                font_size: 24.0,
+            }
+        );
+        assert_eq!(
+            restored_note_layout(&note, 3, 1.125, 1.125),
+            RestoredNoteLayout {
+                x: 10,
+                y: 20,
+                w: 340,
+                h: 66,
+                font_size: 16.0,
+            }
+        );
+    }
+
+    #[test]
+    fn first_launch_removes_legacy_header_without_moving_the_body() {
+        let old_header = NOTE_HEADER.round() as i32;
+        let note = saved_note(10, 20, 340, 66 + old_header, 16.0);
+        let restored = restored_note_layout(&note, 2, 1.0, 2.0);
+        let new_header = (NOTE_HEADER * 2.0).round() as i32;
+        assert_eq!(restored.y, 40 + new_header);
+        assert_eq!(restored.h, 132);
+        assert_eq!(restored.y + restored.h, (20 + 66 + old_header) * 2);
+    }
+
+    #[test]
+    fn dock_hover_padding_only_extends_toward_the_hidden_edge() {
+        let left_docked = test_rect(10, 100, 350, 300);
+        assert!(dock_hover_hit(-1, left_docked, POINT { x: 0, y: 150 }, 16));
+        assert!(!dock_hover_hit(-1, left_docked, POINT { x: -7, y: 150 }, 16));
+        assert!(!dock_hover_hit(-1, left_docked, POINT { x: 350, y: 150 }, 16));
+
+        let right_docked = test_rect(650, 100, 990, 300);
+        assert!(dock_hover_hit(1, right_docked, POINT { x: 999, y: 150 }, 16));
+        assert!(!dock_hover_hit(1, right_docked, POINT { x: 1006, y: 150 }, 16));
+        assert!(!dock_hover_hit(1, right_docked, POINT { x: 649, y: 150 }, 16));
+        assert!(!dock_hover_hit(1, right_docked, POINT { x: 999, y: 300 }, 16));
     }
 
     #[test]
@@ -1920,8 +2087,14 @@ impl App {
                 let _ = GetWindowRect(self.windows[i].hwnd, &mut r);
             }
             if self.windows[i].is_note() {
-                direct_note_hover[i] =
-                    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
+                let side = self.windows[i].docked;
+                direct_note_hover[i] = if side != 0 && self.slide_out_hidden_notes {
+                    let dpi = monitor_area_for_window(self.windows[i].hwnd).dpi;
+                    let padding = dip_to_monitor_px(DOCK_HOVER_EDGE_PADDING_DIP, dpi);
+                    dock_hover_hit(side, r, p, padding)
+                } else {
+                    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+                };
             }
             let dx = (r.left - p.x).max(0).max(p.x - r.right) as f32;
             let dy = (r.top - p.y).max(0).max(p.y - r.bottom) as f32;
@@ -1955,6 +2128,19 @@ impl App {
                 self.windows[i].header_to = header_to;
                 if self.windows[i].header != header_to {
                     wake = true;
+                }
+                // WM_MOUSELEAVE cannot watch the invisible edge cushion once
+                // the pointer is outside the real HWND. The shared proximity
+                // poll finishes the retract after the cursor leaves that area.
+                if self.slide_out_hidden_notes
+                    && self.windows[i].docked != 0
+                    && !self.windows[i].dock_hover_blocked
+                    && self.focused != Some(i)
+                    && drag_idx != Some(i)
+                    && self.manual_sizing != Some(i)
+                    && !direct_note_hover[i]
+                {
+                    self.slide_docked_to(i, DOCK_SLIVER, 0.0);
                 }
             }
         }
@@ -4541,7 +4727,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let side = app.windows[i].docked;
                 if side != 0 {
                     let editing = app.slide_out_hidden_notes && app.focused == Some(i);
-                    if !editing {
+                    let within_edge_padding = if app.slide_out_hidden_notes {
+                        let mut p = POINT::default();
+                        let mut r = RECT::default();
+                        unsafe {
+                            let _ = GetCursorPos(&mut p);
+                            let _ = GetWindowRect(hwnd, &mut r);
+                        }
+                        let dpi = monitor_area_for_window(hwnd).dpi;
+                        let padding = dip_to_monitor_px(DOCK_HOVER_EDGE_PADDING_DIP, dpi);
+                        dock_hover_hit(side, r, p, padding)
+                    } else {
+                        false
+                    };
+                    if !editing && !within_edge_padding {
                         app.slide_docked_to(i, DOCK_SLIVER, 0.0);
                     }
                 }
