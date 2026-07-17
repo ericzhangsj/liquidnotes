@@ -272,10 +272,9 @@ float4 psglass(VSO i) : SV_Target {
     return float4(col * a, a);
 }
 
-// Compositor-native overlay.  The pixels behind this transparent swapchain are
+// Compositor-native overlay. The pixels behind this transparent swapchain are
 // supplied by CreateHostBackdropBrush in DWM's own composition pass; this
-// shader draws only LiquidNotes-owned tint, rim, glow, and text.  It therefore
-// has no desktop texture reads and cannot trail scrolling behind the window.
+// shader draws only LiquidNotes-owned tint, rim, glow, and text.
 float4 psoverlay(VSO i) : SV_Target {
     float2 size = pane.xy;
     float2 p = (i.uv - 0.5) * size;
@@ -300,7 +299,12 @@ float4 psoverlay(VSO i) : SV_Target {
     float3 dangerCol = lerp(float3(0.26, 0.055, 0.070),
                             float3(1.00, 0.76, 0.79), mix);
     fillCol = lerp(fillCol, dangerCol, saturate(light.z));
-    float fillA = saturate(light.w + 0.30 * fx.z);
+    // The exact renderer blends this tint into already-sampled backdrop
+    // pixels.  Here it is a second transparent compositor layer, so a linear
+    // 25% alpha looked like a flat grey card.  Smoothstep keeps the default
+    // clear while preserving the full 0..1 opacity control and active bump.
+    float requestedA = saturate(light.w + 0.30 * fx.z);
+    float fillA = requestedA * requestedA * (3.0 - 2.0 * requestedA);
     float3 outRgb = fillCol * fillA;
     float outA = fillA;
 

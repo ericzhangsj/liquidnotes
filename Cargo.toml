@@ -1,8 +1,8 @@
 [package]
 name = "liquidnotes"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
-description = "Sticky notes with same-frame Windows compositor liquid glass"
+description = "Sticky notes with GPU-refracted liquid glass for Windows"
 license = "MIT"
 
 [dependencies.windows]

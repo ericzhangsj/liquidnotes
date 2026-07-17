@@ -647,23 +647,24 @@ fn main() -> Result<()> {
     // second capture warm-up before the first window can appear.
     let renderer = GlassRenderer::new(&gpu)?;
     let mut cap = Capture::new(&gpu)?;
-    if renderer.is_instant() {
+    if renderer.uses_host_backdrop() {
         // One non-blocking sample is enough to prime the adaptive colour probe;
         // the visible host backdrop is already owned and refreshed by DWM.
         let _ = cap.tick(&[]);
     } else {
         // Exact fallback: seed the background before any of our windows exist,
         // so the pixels under future windows are already known.
-        for _ in 0..300 {
+        for _ in 0..32 {
             cap.tick(&[]);
             if cap.seeded() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         if !cap.seeded() {
-            // Static screen: grab one frame the blocking way.
-            let _ = cap.force_full_refresh(1000);
+            // Static screen: one short blocking attempt. Window creation itself
+            // will wake duplication immediately afterward if this times out.
+            let _ = cap.force_full_refresh(100);
         }
     }
 
@@ -2194,7 +2195,7 @@ impl App {
         //     moment it isn't (kept cheap so switching back is easy).
         // A threshold crossing must still persist ~0.1 s before it commits, so a
         // brief pass over a bright patch never flickers.
-        if self.renderer.is_instant() {
+        if self.renderer.uses_host_backdrop() && !self.renderer.needs_capture_frames() {
             // Capture is only a low-rate colour sensor in compositor mode.  It
             // never gates the visible backdrop or a presentation frame.
             let rects = if self.live { Vec::new() } else { self.window_rects() };
@@ -3590,11 +3591,11 @@ impl App {
     fn pump(&mut self, force_render: bool) -> bool {
         // Live mode: our windows never appear in capture frames, so nothing
         // needs masking and the pixels under notes stay current.
-        let updated = if self.renderer.is_instant() {
-            false
-        } else {
+        let updated = if self.renderer.needs_capture_frames() {
             let rects = if self.live { Vec::new() } else { self.window_rects() };
             self.cap.tick(&rects)
+        } else {
+            false
         };
         if updated || force_render {
             // Only re-render notes whose backdrop actually changed. The glass

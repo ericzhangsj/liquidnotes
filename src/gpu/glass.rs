@@ -21,6 +21,10 @@ use windows::Win32::Graphics::Direct2D::ID2D1Bitmap1;
 
 const SHADER_SRC: &str = include_str!("../../shaders/glass.hlsl");
 
+fn wants_host_renderer(preference: &str) -> bool {
+    matches!(preference, "instant" | "host")
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct Params {
@@ -154,19 +158,16 @@ impl GlassRenderer {
             let renderer_preference = std::env::var("LN_RENDERER")
                 .unwrap_or_default()
                 .to_ascii_lowercase();
-            let force_capture = matches!(
-                renderer_preference.as_str(),
-                "capture" | "exact" | "legacy"
-            );
-            let require_host = matches!(renderer_preference.as_str(), "instant" | "host");
-            let host = if force_capture {
-                None
-            } else if require_host {
+            let require_host = wants_host_renderer(&renderer_preference);
+            // HostBackdrop can legally collapse to a policy-controlled flat
+            // colour on some systems. Keep it explicit-only: the default must
+            // always be the renderer that preserves real curved refraction.
+            let host = if require_host {
                 Some(HostCompositor::new(
                     crate::material::GlassMaterial::from_env().frost,
                 )?)
             } else {
-                HostCompositor::new(crate::material::GlassMaterial::from_env().frost).ok()
+                None
             };
 
             Ok(Self {
@@ -274,8 +275,14 @@ impl GlassRenderer {
     /// True when DWM owns the visible backdrop and updates it in the same
     /// composition pass.  In this mode desktop capture is not on the visual
     /// frame path and can be throttled to the colour probe cadence.
-    pub fn is_instant(&self) -> bool {
+    pub fn uses_host_backdrop(&self) -> bool {
         self.host.is_some() && self.host_usable.get()
+    }
+
+    /// The exact default renderer needs every captured frame. Explicit
+    /// `LN_RENDERER=instant` leaves capture off the visual path.
+    pub fn needs_capture_frames(&self) -> bool {
+        !self.uses_host_backdrop()
     }
 
     /// Draw the persisted hidden-note hover-reveal toggle using the same visual
@@ -728,6 +735,8 @@ impl GlassRenderer {
         if let SurfaceComposition::Host(host) = &s.composition {
             host.set_size(w, h, mat.corner_radius)?;
             host.set_reveal(reveal)?;
+            // The explicit host path never samples a stale/neutral capture.
+            p.refr[0] = 0.0;
             self.pass(
                 &self.ps_overlay,
                 &rtv,
@@ -799,5 +808,19 @@ impl GlassRenderer {
 
         self.present(s)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod renderer_mode_tests {
+    use super::wants_host_renderer;
+
+    #[test]
+    fn real_refraction_is_the_default_renderer() {
+        assert!(!wants_host_renderer(""));
+        assert!(!wants_host_renderer("capture"));
+        assert!(!wants_host_renderer("exact"));
+        assert!(wants_host_renderer("instant"));
+        assert!(wants_host_renderer("host"));
     }
 }

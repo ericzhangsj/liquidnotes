@@ -1,7 +1,7 @@
 # liquidnotes
 
-Always-on-top sticky notes for Windows with a **real** liquid-glass look and a
-same-composition-frame live backdrop. One small `.exe`, no dependencies.
+Always-on-top sticky notes for Windows with a **real** liquid-glass look. One
+small `.exe`, no dependencies.
 
 ## Install
 
@@ -54,13 +54,14 @@ To start it with Windows: right-click the **+** → toggle **Launch on startup**
 
 You won't really notice any of this — it's just there to look and read nicely:
 
-- **Same-frame glass.** By default DWM supplies each note's blurred backdrop in
-  the composition pass that draws the desktop, while LiquidNotes adds its tint,
-  curved-surface rim, glow, and text as a transparent GPU overlay. Scrolling
-  therefore cannot wait on a capture/readback/app-present round trip.
-- **Exact fallback.** `LN_RENDERER=capture` selects the original GPU desktop-
-  duplication renderer with curved-surface refraction, frost, and rim lighting.
-  Its frame queue is capped at one and its luminance readback is asynchronous.
+- **Real liquid glass.** The default GPU desktop-duplication renderer performs
+  normal-driven curved refraction, frost, adaptive tint, and rim lighting. Its
+  frame queue is capped at one, presentation never waits, luminance readback is
+  asynchronous, and the blur kernel uses paired bilinear samples.
+- **Experimental instant backdrop.** `LN_RENDERER=instant` selects Windows'
+  compositor-owned backdrop. It cannot trail scrolling, but Windows may replace
+  it with a policy-controlled flat colour and it cannot perform true curved
+  displacement, so it is intentionally not the default.
 - **Crisp text.** Note text is rendered supersampled and averaged back down, so
   glyphs stay sharp on any display.
 - **Invisible in captures.** By default notes stay out of screenshots and screen
