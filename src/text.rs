@@ -29,6 +29,13 @@ fn header() -> f32 {
     crate::scale::scf(NOTE_HEADER)
 }
 
+/// The hover header's physical height. Window geometry and every text/caret
+/// coordinate must use this same rounded value: mixing an integer HWND resize
+/// with a fractional D2D offset makes the body oscillate by up to half a pixel.
+pub fn note_header_px(header_frac: f32) -> i32 {
+    (header() * header_frac.clamp(0.0, 1.0)).round() as i32
+}
+
 /// Text supersampling factor. The whole text layer (glyphs, caret, and the
 /// settings pill sliders) is rendered at TEXT_SS× the note's pixel resolution —
 /// the D2D DC DPI (96·TEXT_SS), make_target's DPI and make_text's texture size
@@ -259,7 +266,7 @@ impl TextRenderer {
         header_frac: f32,
     ) -> Result<()> {
         unsafe {
-            let header_y = header() * header_frac.clamp(0.0, 1.0);
+            let header_y = note_header_px(header_frac) as f32;
             let empty = text.is_empty();
             let shown = if empty { PLACEHOLDER } else { text };
             let utf16: Vec<u16> = shown.encode_utf16().collect();
@@ -755,7 +762,7 @@ impl TextRenderer {
         header_frac: f32,
     ) -> u32 {
         let utf16: Vec<u16> = text.encode_utf16().collect();
-        let header_y = header() * header_frac.clamp(0.0, 1.0);
+        let header_y = note_header_px(header_frac) as f32;
         unsafe {
             let Ok(layout) = self.dwrite.CreateTextLayout(
                 &utf16,
@@ -806,7 +813,7 @@ impl TextRenderer {
         header_frac: f32,
     ) -> Option<(f32, f32, f32)> {
         let utf16: Vec<u16> = text.encode_utf16().collect();
-        let header_y = header() * header_frac.clamp(0.0, 1.0);
+        let header_y = note_header_px(header_frac) as f32;
         unsafe {
             let layout = self
                 .dwrite

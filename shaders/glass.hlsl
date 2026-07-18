@@ -2,12 +2,12 @@
 // One unified physics pass (psglass) + separable Gaussian frost (psblur).
 // All math fp32; output dithered; alpha premultiplied.
 //
-// Refraction is driven by the DISTANCE to the rounded-rectangle edge (an SDF),
-// so the dome — and therefore the warp — is uniform all the way around,
-// corners included (no separable-product "miter" seam). Blur increases toward
-// the center on its own independent falloff. The rim is a refractive lip plus a
-// Fresnel specular. The baked-in mouse pointer is never sampled: every backdrop
-// lookup is steered out of the pointer's rect.
+// Refraction combines independent horizontal and vertical edge slopes. There
+// is no nearest-edge selection and therefore no diagonal medial/cutoff seam in
+// a corner. Corner energy is normalized so its 45-degree vector is no stronger
+// than either straight side. Blur uses the true rounded-rectangle distance.
+// The rim is a refractive lip plus a Fresnel specular. The baked-in mouse
+// pointer is never sampled: every backdrop lookup is steered out of its rect.
 
 Texture2D srcTex  : register(t0);   // sharp desktop (full output)
 Texture2D blurTex : register(t1);   // pre-blurred backdrop region (center frost)
@@ -21,10 +21,11 @@ cbuffer Params : register(b0) {
     float4 refr;   // eta px | dome exponent q | border refract | border thickness px
     float4 frost;  // sigma | margin offset px | 1/blurTexW, 1/blurTexH
     float4 cursor; // minU, minV, maxU, maxV  (>=2 means "no pointer")
-    float4 blur;   // sigma | radius texels | dir x, y   (psblur only)
+    float4 blur;   // normalized center weight | pair count | dir x, y (psblur)
     float4 light;  // fresnel rim intensity | screen-light azimuth | danger tint | opacity
     float4 fx;     // reveal | snap glow | active (fill opacity bump) | spare (psglass only)
     float4 txcfg;  // text supersample factor | 1/textW | 1/textH | spare (psglass only)
+    float4 blurPairs[32]; // paired offset | normalized pair weight | - | -
 };
 
 struct VSO {
@@ -60,30 +61,34 @@ float prof(float t, float q) {
     return pow(saturate(1.0 - pow(u, q)), 1.0 / q);
 }
 
-// Polynomial smooth-min (C1, crease-free): blends a and b over a k-wide zone.
-float sminp(float a, float b, float k) {
-    float h = saturate(0.5 + 0.5 * (b - a) / max(k, 1e-4));
-    return lerp(b, a, h) - k * h * (1.0 - h);
-}
-
-// Depth in from the pane edge: on the flat edges it is exactly the distance to
-// the nearer edge (identical to the rounded-box field there), and at corners
-// the two edge distances are blended by a smooth-min whose smoothing width is
-// the SILHOUETTE corner radius — so corner roundness is set by corner_radius
-// alone, independent of the dome band.
-float edgeDepth(float2 p, float2 halfsz, float rad) {
-    float dx = halfsz.x - abs(p.x);
-    float dy = halfsz.y - abs(p.y);
-    return sminp(dx, dy, max(rad, 1e-3));
-}
-
-// Dome height z = f(x,y): a function of the depth in from the pane edge, so
-// iso-height contours run parallel to the border and the refraction is
-// identical at a given depth whether that depth is reached at a flat edge or
-// a corner. `rad` is the silhouette corner radius (shape.x clamped).
-float domeH(float2 p, float2 halfsz, float band, float q, float rad) {
-    float depth = edgeDepth(p, halfsz, rad);
+// One edge shoulder. prof() reaches its plateau with zero slope, so the abs()
+// symmetry at the pane centre cannot create a horizontal or vertical seam.
+float axisDome(float coord, float halfExtent, float band, float q) {
+    float depth = halfExtent - abs(coord);
     return prof(depth / max(band, 1e-3), q);
+}
+
+// Refraction normal with no scalar min/smooth-min field. Each component comes
+// only from its corresponding pair of sides; the two are then combined
+// continuously. The energy normalization removes the sqrt(2) focusing ridge
+// that an unnormalised vector would otherwise create at a 45-degree corner.
+float3 domeNormal(float2 p, float2 halfsz, float band, float q, float hs) {
+    const float e = 1.0;
+    float hx = axisDome(p.x + e, halfsz.x, band, q)
+             - axisDome(p.x - e, halfsz.x, band, q);
+    float hy = axisDome(p.y + e, halfsz.y, band, q)
+             - axisDome(p.y - e, halfsz.y, band, q);
+    float2 slope = -float2(hx, hy) * (hs / (2.0 * e));
+
+    float2 slope2 = slope * slope;
+    float energy = slope2.x + slope2.y;
+    // 0 when only one side contributes, 1 when both contribute equally.
+    // Squared terms keep this analytic through the horizontal/vertical axes.
+    float coexistence = 4.0 * slope2.x * slope2.y
+                      / max(energy * energy, 1e-12);
+    float cornerScale = rsqrt(1.0 + coexistence);
+    slope *= cornerScale;
+    return normalize(float3(slope, 1.0));
 }
 
 // Steer a backdrop sample out of the pointer's rect so the baked-in cursor is
@@ -118,17 +123,11 @@ float4 psglass(VSO i) : SV_Target {
 
     float d = sdrb(p, halfsz, rad);   // container SDF, for alpha + rim mask
 
-    // Depth in from the edge: smooth-min edge field, corner smoothing = the
-    // silhouette corner radius only (decoupled from the dome band).
-    float depth = edgeDepth(p, halfsz, rad);
+    // Scalar rim/frost effects use the true rounded-rectangle distance so they
+    // follow the visible silhouette exactly.
+    float depth = -d;
 
-    // N = normalize([-df/dx, -df/dy, 1]), central differences, eps = 1px.
-    float e = 1.0;
-    float hx = domeH(p + float2(e, 0), halfsz, band, dome, rad)
-             - domeH(p - float2(e, 0), halfsz, band, dome, rad);
-    float hy = domeH(p + float2(0, e), halfsz, band, dome, rad)
-             - domeH(p - float2(0, e), halfsz, band, dome, rad);
-    float3 N = normalize(float3(-hx * hs / (2.0 * e), -hy * hs / (2.0 * e), 1.0));
+    float3 N = domeNormal(p, halfsz, band, dome, hs);
 
     // Mechanism A (bevel shift): within the rim zone the shader squeezes the
     // backdrop harder, so elements passing behind the border compress — the
@@ -228,21 +227,9 @@ float4 psglass(VSO i) : SV_Target {
     // font on a dark box, near-black font on a light box. Same `mix` band as
     // the fill so the ink cross-fades in lockstep with the box colour.
     //
-    // Supersampled text: the text layer is rendered at TEXT_SS× the note
-    // resolution, so downsample by averaging an ss×ss box of texels. Each tap
-    // lands exactly on a source-texel centre (uv ± whole texels), so the linear
-    // sampler returns that texel unblended — a true box average, not a smeared
-    // single tap. This is what makes the glyph edges read high-res/crisp.
-    int ss = max(1, (int)txcfg.x);
-    float2 tpx = txcfg.yz;               // one text texel in uv
-    float2 c0 = -0.5 * (float(ss) - 1.0) * tpx; // top-left tap offset of the box
-    float4 txt = 0.0;
-    [loop] for (int ty = 0; ty < ss; ++ty) {
-        [loop] for (int tx = 0; tx < ss; ++tx) {
-            txt += textTex.Sample(samp, i.uv + c0 + float2(tx, ty) * tpx);
-        }
-    }
-    txt /= float(ss * ss);
+    // Supersampled text is box-resolved only when its contents change; live
+    // glass frames sample the cached native-resolution coverage once.
+    float4 txt = textTex.Sample(samp, i.uv);
     if (txt.a > 0.001) {
         float3 ink = lerp(float3(0.97, 0.97, 0.98),   // white on dark box
                           float3(0.08, 0.08, 0.10),   // near-black on light box
@@ -273,7 +260,7 @@ float4 psglass(VSO i) : SV_Target {
 }
 
 // Compositor-native overlay. The pixels behind this transparent swapchain are
-// supplied by CreateHostBackdropBrush in DWM's own composition pass; this
+// supplied by a CompositionBackdropBrush in DWM's own composition pass; this
 // shader draws only LiquidNotes-owned tint, rim, glow, and text.
 float4 psoverlay(VSO i) : SV_Target {
     float2 size = pane.xy;
@@ -284,14 +271,9 @@ float4 psoverlay(VSO i) : SV_Target {
     float rad = min(shape.x, min(halfsz.x, halfsz.y));
     float dome = max(refr.y, 1.05);
     float d = sdrb(p, halfsz, rad);
-    float depth = edgeDepth(p, halfsz, rad);
+    float depth = -d;
 
-    float e = 1.0;
-    float hx = domeH(p + float2(e, 0), halfsz, band, dome, rad)
-             - domeH(p - float2(e, 0), halfsz, band, dome, rad);
-    float hy = domeH(p + float2(0, e), halfsz, band, dome, rad)
-             - domeH(p - float2(0, e), halfsz, band, dome, rad);
-    float3 N = normalize(float3(-hx * hs / (2.0 * e), -hy * hs / (2.0 * e), 1.0));
+    float3 N = domeNormal(p, halfsz, band, dome, hs);
 
     float mix = saturate(fx.w);
     float3 fillCol = lerp(float3(0.10, 0.10, 0.12),
@@ -299,38 +281,59 @@ float4 psoverlay(VSO i) : SV_Target {
     float3 dangerCol = lerp(float3(0.26, 0.055, 0.070),
                             float3(1.00, 0.76, 0.79), mix);
     fillCol = lerp(fillCol, dangerCol, saturate(light.z));
-    // The exact renderer blends this tint into already-sampled backdrop
-    // pixels.  Here it is a second transparent compositor layer, so a linear
-    // 25% alpha looked like a flat grey card.  Smoothstep keeps the default
-    // clear while preserving the full 0..1 opacity control and active bump.
+    // Source-over compositing this transparent tint over HostBackdrop is
+    // algebraically the same blend used by psglass, so retain the exact old
+    // material opacity curve. The former smoothstep workaround was masking the
+    // missing Win32 HostBackdrop opt-in and made the two renderers mismatch.
     float requestedA = saturate(light.w + 0.30 * fx.z);
-    float fillA = requestedA * requestedA * (3.0 - 2.0 * requestedA);
+    float fillA = requestedA;
     float3 outRgb = fillCol * fillA;
     float outA = fillA;
+
+    // Synthetic lens relief, confined to the shoulder instead of blurring the
+    // whole pane. A bright inner caustic faces the screen-space light while a
+    // shallow shadow sits on the far edge. Together they preserve the old
+    // material's curved depth cue without sampling a delayed capture texture.
+    float2 Ldir = float2(cos(light.y), sin(light.y));
+    float2 En = normalize(N.xy + float2(1e-5, 0.0));
+    float facing = 0.5 + 0.5 * dot(En, Ldir);
+    float slope = saturate(length(N.xy) * 4.0);
+    float innerBand = smoother(1.0, 3.5, depth)
+                    * (1.0 - smoother(7.0, 14.0, depth));
+
+    float shadowA = saturate(light.x * innerBand * slope
+                           * (0.035 + 0.085 * (1.0 - facing)));
+    outRgb *= 1.0 - shadowA;
+    outA = shadowA + outA * (1.0 - shadowA);
+
+    float causticA = saturate(light.x * innerBand * slope
+                            * (0.07 + 0.22 * facing));
+    float3 causticCol = lerp(float3(0.76, 0.88, 1.0),
+                             float3(1.0, 1.0, 1.0), facing);
+    outRgb = causticCol * causticA + outRgb * (1.0 - causticA);
+    outA = causticA + outA * (1.0 - causticA);
+
+    // A broad, low-opacity reflection across the upper surface keeps large
+    // plain regions reading as glass while leaving backdrop detail intact.
+    float sweep = abs((i.uv.y - 0.20) + 0.12 * (i.uv.x - 0.5));
+    float sheenBand = 1.0 - smoother(0.0, 0.22, sweep);
+    float bodyMask = smoother(1.0, 7.0, -d);
+    float sheenA = saturate(light.x * 0.065 * sheenBand * bodyMask);
+    outRgb = float3(1.0, 1.0, 1.0) * sheenA + outRgb * (1.0 - sheenA);
+    outA = sheenA + outA * (1.0 - sheenA);
 
     // Preserve the directional liquid highlight from the exact renderer.  The
     // host backdrop supplies the material body while this analytic normal and
     // border SDF preserve its responsive glass edge.
     if (light.x > 0.0001) {
         float rimMask = 1.0 - smoother(0.0, 3.0, -d);
-        float2 Ldir = float2(cos(light.y), sin(light.y));
-        float2 En = normalize(N.xy + float2(1e-5, 0.0));
         float dirW = 0.5 + 0.5 * dot(En, Ldir);
         float rimA = saturate(light.x * rimMask * (0.2 + 0.8 * dirW));
         outRgb = lerp(outRgb, float3(1.0, 1.0, 1.0), rimA);
         outA = rimA + outA * (1.0 - rimA);
     }
 
-    int ss = max(1, (int)txcfg.x);
-    float2 tpx = txcfg.yz;
-    float2 c0 = -0.5 * (float(ss) - 1.0) * tpx;
-    float4 txt = 0.0;
-    [loop] for (int ty = 0; ty < ss; ++ty) {
-        [loop] for (int tx = 0; tx < ss; ++tx) {
-            txt += textTex.Sample(samp, i.uv + c0 + float2(tx, ty) * tpx);
-        }
-    }
-    txt /= float(ss * ss);
+    float4 txt = textTex.Sample(samp, i.uv);
     if (txt.a > 0.001) {
         float3 ink = lerp(float3(0.97, 0.97, 0.98),
                           float3(0.08, 0.08, 0.10), mix);
@@ -351,36 +354,45 @@ float4 psoverlay(VSO i) : SV_Target {
     return float4(outRgb, outA);
 }
 
+// Resolve the TEXT_SSx DirectWrite coverage texture once when text/chrome
+// changes. This is the exact box average previously repeated inside every
+// live glass pixel; caching it makes backdrop-only frames one text tap each.
+float4 pstext(VSO i) : SV_Target {
+    int ss = max(1, (int)txcfg.x);
+    float2 tpx = txcfg.yz;
+    float2 c0 = -0.5 * (float(ss) - 1.0) * tpx;
+    float4 txt = 0.0;
+    [loop] for (int ty = 0; ty < ss; ++ty) {
+        [loop] for (int tx = 0; tx < ss; ++tx) {
+            txt += srcTex.Sample(samp, i.uv + c0 + float2(tx, ty) * tpx);
+        }
+    }
+    return txt / float(ss * ss);
+}
+
 // Separable Gaussian; run twice with blur.zw = (1,0) then (0,1).
 // Skipped entirely by the CPU side when the center frost is off.
 float4 psblur(VSO i) : SV_Target {
     float2 basePx = pane.zw + i.uv * pane.xy;
-    float sigma = max(blur.x, 0.01);
-    int radius = (int)blur.y;
+    float centerWeight = blur.x;
+    int pairCount = (int)blur.y;
     float2 dir = blur.zw;
     float3 acc = 0.0;
-    float wsum = 0.0;
     // Centre plus bilinear-paired symmetric taps.  Two neighbouring Gaussian
     // coefficients become one sample at their weighted fractional position,
-    // nearly halving texture reads (25 -> 13 at the default sigma) while
-    // preserving the same radius and normalized kernel energy.
-    float wc = 1.0;
+    // nearly halving texture reads. Offsets and normalized weights are
+    // precomputed once on the CPU instead of evaluating exp() for every pixel.
     float3 centre = srcTex.Sample(samp, avoidCursor(basePx * src.zw, cursor)).rgb;
-    acc = centre * centre * wc;
-    wsum = wc;
-    for (int k = 1; k <= radius; k += 2) {
-        float w0 = exp(-0.5 * float(k * k) / (sigma * sigma));
-        int k1 = min(k + 1, radius);
-        float w1 = (k1 == k) ? 0.0 : exp(-0.5 * float(k1 * k1) / (sigma * sigma));
-        float pairW = w0 + w1;
-        float offset = (float(k) * w0 + float(k1) * w1) / max(pairW, 1e-6);
+    acc = centre * centre * centerWeight;
+    [loop] for (int pair = 0; pair < pairCount; ++pair) {
+        float offset = blurPairs[pair].x;
+        float pairW = blurPairs[pair].y;
         float2 duv = dir * offset;
         float3 sp = srcTex.Sample(samp, avoidCursor((basePx + duv) * src.zw, cursor)).rgb;
         float3 sn = srcTex.Sample(samp, avoidCursor((basePx - duv) * src.zw, cursor)).rgb;
         acc += (sp * sp + sn * sn) * pairW;
-        wsum += 2.0 * pairW;
     }
-    return float4(sqrt(acc / wsum), 1.0);
+    return float4(sqrt(acc), 1.0);
 }
 
 // Minimal soft drop shadow for a note's companion window (sized note + 2*margin).

@@ -50,18 +50,29 @@ To start it with Windows: right-click the **+** → toggle **Launch on startup**
 | Ctrl+= / Ctrl+- | Grow / shrink the note's font |
 | Ctrl+W | Close the note |
 
+### Material tuning
+
+LiquidNotes creates `%APPDATA%\liquidnotes\material.json` on first launch.
+Edit its numeric values and restart the app to tune refraction, blur, dome
+depth, corner radius, rim width/refraction, lighting, and light angle. Glass
+opacity remains controlled by the existing in-app slider. The supported range
+for every file control is documented inside the file; malformed or out-of-range
+values safely fall back to bounded defaults.
+
 ## Under the hood
 
 You won't really notice any of this — it's just there to look and read nicely:
 
 - **Real liquid glass.** The default GPU desktop-duplication renderer performs
-  normal-driven curved refraction, frost, adaptive tint, and rim lighting. Its
+  normal-driven curved refraction, adaptive tint, and rim lighting. Frost is
+  intentionally light by default and adjustable with `LN_FROST`, so detail
+  remains visible through the material. Its
   frame queue is capped at one, presentation never waits, luminance readback is
   asynchronous, and the blur kernel uses paired bilinear samples.
 - **Experimental instant backdrop.** `LN_RENDERER=instant` selects Windows'
-  compositor-owned backdrop. It cannot trail scrolling, but Windows may replace
-  it with a policy-controlled flat colour and it cannot perform true curved
-  displacement, so it is intentionally not the default.
+  compositor-owned backdrop. It cannot trail scrolling, but it cannot displace
+  the backdrop pixels into real curved refraction, so it is intentionally not
+  the default.
 - **Crisp text.** Note text is rendered supersampled and averaged back down, so
   glyphs stay sharp on any display.
 - **Invisible in captures.** By default notes stay out of screenshots and screen

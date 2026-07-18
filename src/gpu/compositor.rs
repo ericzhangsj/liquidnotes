@@ -1,8 +1,8 @@
 //! Same-frame Windows compositor backdrop for the low-latency renderer.
 //!
 //! The desktop-duplication renderer remains available as a compatibility and
-//! pixel-exact fallback.  This path deliberately leaves backdrop ownership in
-//! DWM: HostBackdrop is sampled during composition, so scrolling behind a note
+//! pixel-exact fallback. This path deliberately leaves backdrop ownership in
+//! DWM: the backdrop is sampled during composition, so scrolling behind a note
 //! cannot wait on LiquidNotes' capture, shader, message-loop, and present chain.
 
 use std::sync::Mutex;
@@ -18,6 +18,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D1_BORDER_MODE_HARD;
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1GaussianBlur, D2D1_GAUSSIANBLUR_OPTIMIZATION_SPEED,
 };
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_HOSTBACKDROPBRUSH};
 use windows::Win32::Graphics::Dxgi::IDXGISwapChain1;
 use windows::Win32::System::WinRT::Composition::{ICompositorDesktopInterop, ICompositorInterop};
 use windows::Win32::System::WinRT::Graphics::Direct2D::{
@@ -29,14 +30,15 @@ use windows::Win32::System::WinRT::{
 };
 use windows::UI::Composition::Desktop::DesktopWindowTarget;
 use windows::UI::Composition::{
-    CompositionEffectFactory, CompositionGeometricClip, CompositionRoundedRectangleGeometry,
-    CompositionSurfaceBrush, Compositor, ContainerVisual, SpriteVisual,
+    CompositionBackdropBrush, CompositionEffectFactory, CompositionGeometricClip,
+    CompositionRoundedRectangleGeometry, CompositionStretch, CompositionSurfaceBrush, Compositor,
+    ContainerVisual, ICompositionSurface, SpriteVisual,
 };
 use windows_numerics::{Vector2, Vector3};
 
 const BACKDROP_SOURCE: &str = "backdrop";
 
-/// Minimal dependency-free Win2D-compatible Gaussian descriptor.  Windows
+/// Minimal dependency-free Win2D-compatible Gaussian descriptor. Windows
 /// Composition consumes these three standard D2D properties directly; no
 /// custom shader or packaged Win2D runtime is involved.
 #[implement(IGraphicsEffect, IGraphicsEffectSource, IGraphicsEffectD2D1Interop)]
@@ -115,9 +117,11 @@ pub struct HostCompositor {
     compositor: Compositor,
     desktop: ICompositorDesktopInterop,
     interop: ICompositorInterop,
-    blur_factory: CompositionEffectFactory,
+    blur_factory: Option<CompositionEffectFactory>,
+    blur_amount: f32,
+    use_host_backdrop: bool,
     // A current-thread DispatcherQueue is required when hosting the Visual
-    // Layer in a classic Win32 message loop.  Keep its controller alive.
+    // Layer in a classic Win32 message loop. Keep its controller alive.
     _queue: DispatcherQueueController,
 }
 
@@ -126,8 +130,12 @@ pub struct HostSurface {
     root: ContainerVisual,
     backdrop: SpriteVisual,
     _content: SpriteVisual,
+    _backdrop_brush: CompositionBackdropBrush,
     clip_geometry: CompositionRoundedRectangleGeometry,
     _clip: CompositionGeometricClip,
+    // Keep both the interop surface and brush alive for the full target life;
+    // dropping either during startup can leave the first swapchain frame blank.
+    _surface: ICompositionSurface,
     _surface_brush: CompositionSurfaceBrush,
 }
 
@@ -143,23 +151,33 @@ impl HostCompositor {
             let desktop: ICompositorDesktopInterop = compositor.cast()?;
             let interop: ICompositorInterop = compositor.cast()?;
 
-            let parameter = windows::UI::Composition::CompositionEffectSourceParameter::Create(
-                &HSTRING::from(BACKDROP_SOURCE),
-            )?;
-            let source: IGraphicsEffectSource = parameter.cast()?;
-            let effect: IGraphicsEffect = GaussianBlurEffect {
-                name: Mutex::new(HSTRING::from("LiquidNotesBlur")),
-                source,
-                sigma,
-            }
-            .into();
-            let blur_factory = compositor.CreateEffectFactory(&effect)?;
+            let blur_amount = sigma.max(0.0);
+            let blur_factory = if blur_amount > 0.05 {
+                let parameter = windows::UI::Composition::CompositionEffectSourceParameter::Create(
+                    &HSTRING::from(BACKDROP_SOURCE),
+                )?;
+                let source: IGraphicsEffectSource = parameter.cast()?;
+                let effect: IGraphicsEffect = GaussianBlurEffect {
+                    name: Mutex::new(HSTRING::from("LiquidNotesBlur")),
+                    source,
+                    sigma: blur_amount,
+                }
+                .into();
+                Some(compositor.CreateEffectFactory(&effect)?)
+            } else {
+                None
+            };
+            let use_host_backdrop = std::env::var("LN_BACKDROP_BRUSH")
+                .map(|value| value.eq_ignore_ascii_case("host"))
+                .unwrap_or(false);
 
             Ok(Self {
                 compositor,
                 desktop,
                 interop,
                 blur_factory,
+                blur_amount,
+                use_host_backdrop,
                 _queue: queue,
             })
         }
@@ -175,25 +193,58 @@ impl HostCompositor {
         backdrop_enabled: bool,
     ) -> Result<HostSurface> {
         unsafe {
+            // Classic Win32 windows must explicitly opt in before the visual
+            // tree is attached. This is also required for BackdropBrush to be
+            // committed reliably on the Windows desktop compositor; it does
+            // not force us to use the softer HostBackdropBrush sampling path.
+            if backdrop_enabled {
+                let enabled: i32 = 1;
+                DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_HOSTBACKDROPBRUSH,
+                    (&enabled as *const i32).cast(),
+                    std::mem::size_of_val(&enabled) as u32,
+                )?;
+            }
+
             let target = self.desktop.CreateDesktopWindowTarget(hwnd, true)?;
             let root = self.compositor.CreateContainerVisual()?;
             let backdrop = self.compositor.CreateSpriteVisual()?;
             let content = self.compositor.CreateSpriteVisual()?;
 
-            let host_brush = self.compositor.CreateHostBackdropBrush()?;
-            let blur_brush = self.blur_factory.CreateBrush()?;
-            blur_brush.SetSourceParameter(&HSTRING::from(BACKDROP_SOURCE), &host_brush)?;
-            backdrop.SetBrush(&blur_brush)?;
+            let backdrop_brush = if self.use_host_backdrop {
+                self.compositor.CreateHostBackdropBrush()?
+            } else {
+                self.compositor.CreateBackdropBrush()?
+            };
+            if self.blur_amount > 0.05 {
+                let blur_brush = self.blur_factory.as_ref().unwrap().CreateBrush()?;
+                blur_brush.SetSourceParameter(&HSTRING::from(BACKDROP_SOURCE), &backdrop_brush)?;
+                backdrop.SetBrush(&blur_brush)?;
+            } else {
+                // Do not run a nominal zero through GaussianBlurEffect: on
+                // some compositor versions the effect retains its default
+                // blur and still washes out all backdrop detail.
+                backdrop.SetBrush(&backdrop_brush)?;
+            }
 
             let surface = self
                 .interop
                 .CreateCompositionSurfaceForSwapChain(swapchain)?;
             let surface_brush = self.compositor.CreateSurfaceBrushWithSurface(&surface)?;
+            // A swapchain surface has no intrinsic visual layout. Explicit Fill
+            // follows Microsoft's Win32 hosting pattern and makes the first
+            // transparent text/chrome frame sample across the whole visual.
+            surface_brush.SetStretch(CompositionStretch::Fill)?;
+            surface_brush.SetHorizontalAlignmentRatio(0.0)?;
+            surface_brush.SetVerticalAlignmentRatio(0.0)?;
             content.SetBrush(&surface_brush)?;
 
             let geometry = self.compositor.CreateRoundedRectangleGeometry()?;
             let clip = self.compositor.CreateGeometricClipWithGeometry(&geometry)?;
-            backdrop.SetClip(&clip)?;
+            if backdrop_enabled {
+                root.SetClip(&clip)?;
+            }
 
             let children = root.Children()?;
             if backdrop_enabled {
@@ -207,8 +258,10 @@ impl HostCompositor {
                 root,
                 backdrop,
                 _content: content,
+                _backdrop_brush: backdrop_brush,
                 clip_geometry: geometry,
                 _clip: clip,
+                _surface: surface,
                 _surface_brush: surface_brush,
             };
             surface.set_size(width, height, corner_radius)?;
@@ -233,6 +286,24 @@ impl HostSurface {
             Y: radius,
         })?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_glass(
+        &self,
+        width: u32,
+        height: u32,
+        corner_radius: f32,
+        _depth: f32,
+        _refraction: f32,
+        _border_refract: f32,
+        _border_thickness: f32,
+        _frost: f32,
+    ) -> Result<()> {
+        // Windows rejects transformed backdrop-brush sources. The backdrop
+        // stays compositor-native and same-frame; the transparent overlay owns
+        // the material's analytic tint, normal-driven rim, glow, and text.
+        self.set_size(width, height, corner_radius)
     }
 
     pub fn set_reveal(&self, reveal: f32) -> Result<()> {

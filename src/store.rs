@@ -199,9 +199,37 @@ struct Parser<'a> {
     i: usize,
 }
 
+/// Parse a JSON object and return its top-level numeric fields. Material
+/// configuration reuses the app's strict JSON parser without exposing the
+/// persistence AST or adding a second JSON dependency. Nested help metadata
+/// and unknown fields remain valid and are simply ignored by the caller.
+pub(crate) fn parse_number_fields(s: &str) -> Option<Vec<(String, f64)>> {
+    let mut p = Parser::new(s);
+    let root = p.value()?;
+    p.skip_ws();
+    if p.i != p.b.len() {
+        return None;
+    }
+    let Json::Obj(pairs) = root else {
+        return None;
+    };
+    Some(
+        pairs
+            .into_iter()
+            .filter_map(|(key, value)| match value {
+                Json::Num(number) if number.is_finite() => Some((key, number)),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 impl<'a> Parser<'a> {
     fn new(s: &'a str) -> Self {
-        Parser { b: s.as_bytes(), i: 0 }
+        Parser {
+            b: s.as_bytes(),
+            i: 0,
+        }
     }
 
     fn skip_ws(&mut self) {
@@ -639,17 +667,17 @@ mod tests {
         assert_eq!(store2.notes[0].text, "aA \u{e9} \u{4f60} \u{1f642}");
 
         // Lone/mismatched surrogates are rejected.
-        assert!(parse("{\"version\":1,\"next_id\":1,\"notes\":[{\"id\":1,\
-            \"text\":\"x\\ud83dx\",\"x\":0,\"y\":0,\"w\":1,\"h\":1}]}")
-            .is_none());
+        assert!(parse(
+            "{\"version\":1,\"next_id\":1,\"notes\":[{\"id\":1,\
+            \"text\":\"x\\ud83dx\",\"x\":0,\"y\":0,\"w\":1,\"h\":1}]}"
+        )
+        .is_none());
     }
 
     #[test]
     fn save_atomic_round_trip_on_disk() {
-        let path = std::env::temp_dir().join(format!(
-            "liquidnotes_test_{}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("liquidnotes_test_{}.json", std::process::id()));
         let original = sample_store();
         save_atomic_to(&path, &original).expect("save failed");
         let loaded = load_from(&path);
